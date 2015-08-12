@@ -519,5 +519,40 @@ ngx_http_lua_report(ngx_log_t *log, lua_State *L, int status,
     return status == 0 ? NGX_OK : NGX_ERROR;
 }
 
+int
+ngx_http_lua_traceback(lua_State *L)
+{
+    if (!lua_isstring(L, 1)) { /* 'message' not a string? */
+        return 1;  /* keep it intact */
+    }
+
+    lua_getglobal(L, "debug");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return 1;
+    }
+
+    lua_getfield(L, -1, "traceback");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 2);
+        return 1;
+    }
+
+    lua_pushvalue(L, 1);  /* pass error message */
+    lua_pushinteger(L, 2);  /* skip this function and traceback */
+    lua_call(L, 2, 1);  /* call debug.traceback */
+    return 1;
+}
+
 
 ```
+我们把相关的函数代码都编排在一块看， ngx_http_lua_init_by_inline 函数按步骤执行了下面的功能：
+*  调用 luaL_loadbuffer 把传入的 Lua 代码字符串解析成代码块，并作为一个函数压栈。
+*  调用 ngx_http_lua_do_call 函数把 ngx_http_lua_traceback 函数压栈，并把 ngx_http_lua_traceback 压到刚使用 luaL_loadbuffer 压入的函数之下。
+*  调用 lua_pcall 执行 luaL_loadbuffer 压入的函数，错误处理函数被指向 ngx_http_lua_traceback。
+*  调用 lua_remove 从栈中删除 ngx_http_lua_traceback 函数。
+*  调用 ngx_http_lua_report 根据 status 状态码，把错误信息以 NGX_LOG_ERR 日志等级写入 error 日志，并进行资源回收。
+
+由于 ngx_http_lua_init_worker 中调用 ngx_http_lua_init_by_inline 是不处理返回值的，所以不管 Lua 代码调用成功还是失败，nginx 程序都将继续往执行。
+剩下的其他函数如：ngx_http_lua_init_by_file ， ngx_http_lua_init_worker_by_inline ， ngx_http_lua_init_worker_by_file 都是类似的代码结构，这里就不一一展开了。
+
