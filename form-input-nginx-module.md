@@ -396,5 +396,5 @@ ngx_http_form_input_post_read(ngx_http_request_t *r)
 配置文件读取阶段处理两个指令 set_form_input 和 set_form_input_multi，并设置 ngx_http_set_form_input_multi 作为变量函数。
 配置文件读取结束阶段往 rewrite 阶段处理函数列表添加了模块自己定义的 ngx_http_form_input_handler。
 请求到来阶段，在 rewrite 阶段执行 ngx_http_form_input_handler，用于判断请求是否需要本模块处理。
-在 rewrite 阶段的下一处理回调函数中会有通过 ndk_ 的，依据 ngx_http_set_form_input 或者 ngx_http_set_form_input_multi 读取 body 内容并解析赋值于指定的 nginx 变量中。
+在 rewrite 阶段的下一处理回调函数中会有通过 ndk_set_var_multi_value_core 函数设置的回调，依据 ngx_http_set_form_input 或者 ngx_http_set_form_input_multi 读取 body 内容并解析赋值于指定的 nginx 变量中。
 
