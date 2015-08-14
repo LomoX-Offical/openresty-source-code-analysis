@@ -186,7 +186,7 @@ ngx_http_lua_cache_loadbuffer(ngx_http_request_t *r, lua_State *L,
         return NGX_OK;
     }
 
-    // cache_key 找不到，老老实实加载 Lua 代码
+    // cache_key 找不到，老老实实加载 Lua 代码，这里要注意“代码工厂”的概念
     rc = ngx_http_lua_clfactory_loadbuffer(L, (char *) src, src_len, name);
     
     // 把刚加载的 Lua 代码块按 cache_key 索引存储起来 
@@ -262,7 +262,104 @@ ngx_http_lua_rewrite_by_lua(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 ```
 
+ngx_http_lua_rewrite_by_lua 函数，在处理 rewrite_by_lua* 指令时在 location 的配置结构上设置了 rewrite_handler 的回调，计算了 Lua 代码的 cache_key，然后在请求处理的 rewrite 阶段，通过这些回调处理指令输入的 Lua 代码，执行结果对 rewrite 阶段产生影响。
+
+## access_by_lua 系列
+跟 rewrite_by_lua\* 指令类似的还有， access_by_lua\*  和 content_by_lua\*, log_by_lua\*，他们的区别是插入的阶段不一样，我们除了要考虑编写正确的 Lua 代码的同时，还要掌握好根据 Lua 代码功能，在恰当的请求处理阶段插入 Lua 代码。
+一般情况下： 
+
+*  rewrite_by_lua* 上的 Lua 代码用于处理跳转逻辑。
+*  access_by_lua* 上的 Lua 代码用于访问权限逻辑。
+*  content_by_lua* 上的 Lua 代码用于内容生成逻辑。
+*  log_by_lua* 上的 Lua 代码用于写日志之后做剩余收尾逻辑，比如说统计或者其他的。
+
+access_by_lua*，这个阶段大部分与 rewrite_by_lua*类似，大致流程是这样的：
+
+配置读取阶段(ngx_http_lua_access_by_lua)： 
+*  根据 Lua 代码字符串计算 cache_key
+*  向 location 配置挂载 access_handler（也就是 ngx_http_lua_access_handler_inline ）
+
+初始化阶段(ngx_http_lua_init)：
+*  向 core 模块 main 配置的 access 阶段处理回调队列插入 ngx_http_lua_access_handler
+
+请求处理的 access 阶段( ngx_http_lua_access_handler )：
+*  一次性地，把 ngx_http_lua_access_handler 放到 access 阶段处理回调队列的最后，也就是说明文档所说的，跟在 HttpAccessModule 的处理过后执行。
+*  调用 access_handler 回调，也就是 ngx_http_lua_access_handler_inline 
+*  ngx_http_lua_access_handler_inline 内，获取 Lua 虚拟机
+*  通过 cache_key 获取代码块，并在 Lua 虚拟机中运行这个代码块。
+
+content_by_lua\* 有一点点区别：
+
+*  配置读取阶段( ngx_http_lua_content_by_lua )，向 location 的 ngx_http_core_module 模块设置 handler 回调为 ngx_http_lua_content_handler
+*  初始化阶段( ngx_http_lua_init )，没有像其他指令一样，它并没有向某个阶段插入回调。
+*  请求处理的 content 阶段( ngx_http_lua_content_handler )，也没有像其他指令一样一次性的挪动 handler 操作，因为 content handler 只能有一个。
+
+## *_filter_by_lua 系列
+header_filter_by_lua\* 和 body_filter_by_lua\* 这两个指令允许在 发送 header 以及 body 前，执行 Lua 代码对将要发送的内容进行过滤。
+
+在一般处理流程中， content 阶段的 hanlder 需要执行 ngx_http_send_header 以及 ngx_http_output_filter 以分别把 header 以及 body 作为应答数据发送给客户端。
+ngx_http_send_header 函数会调用 ngx_http_top_header_filter，各种 filter 模块要实现其 filter 功能，就必须 把 ngx_http_top_header_filter 指针设定成自己模块的一个函数，然后把原本的 ngx_http_top_header_filter 保存在本模块的 ngx_http_next_header_filter 上，并在 自己的 filter 函数中调用 ngx_http_next_header_filter ，这样子居然形成了一个回调链条， filter 被准确无误的挨个被执行了。
+
+filter 模块可以实现的功能挺多，可以对 content 阶段产生的内容做各种加工处理，比如说， nginx 内部的 gzip 过滤模块，就利用 filter 特性把内容从明文转成 gzip。而他的初始化代码如下：
+
+```c
+
+static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
+static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
+
+static ngx_int_t
+ngx_http_gzip_filter_init(ngx_conf_t *cf)
+{
+    ngx_http_next_header_filter = ngx_http_top_header_filter;
+    ngx_http_top_header_filter = ngx_http_gzip_header_filter;
+
+    ngx_http_next_body_filter = ngx_http_top_body_filter;
+    ngx_http_top_body_filter = ngx_http_gzip_body_filter;
+
+    return NGX_OK;
+}
+
+```
+
+基本上 filter 模块的初始化都要做把模块的 filter 函数插入到 header 和 body filter 链表头上，所以越晚注册的模块越早执行。按 ngx_modules 模块列表定义，header 的最后一个可执行 filter 是 ngx_http_header_filter_module ， 而 body 的最后一个可执行 filter 是 ngx_http_write_filter_module ，他们的指责就是往客户端发送最终的数据。
+
+我们的主角 lua-nginx-module 模块也不例外，被同样被定义在这两个模块之后，所以他们会可以在最终发送给用户前，内容先被 lua-nginx-module 处理一遍。
+
+读取配置阶段与之前的指令处理流程基本类似，在 header 的 filter 处理如下：
+
+```c
+
+static ngx_int_t
+ngx_http_lua_header_filter(ngx_http_request_t *r)
+{
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_lua_module);
+
+    if (llcf->header_filter_handler == NULL) {
+        // 如果 location 没指定 Lua 代码，跳过本 filter
+        return ngx_http_next_header_filter(r);
+    }
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
+
+    old_context = ctx->context;
+    ctx->context = NGX_HTTP_LUA_CONTEXT_HEADER_FILTER;
+
+    // 调用 filter 的 Lua 代码 
+    rc = llcf->header_filter_handler(r);
+
+    ctx->context = old_context;
+
+    if (rc == NGX_DECLINED) {
+        return NGX_OK;
+    }
+
+    if (rc == NGX_AGAIN || rc == NGX_ERROR) {
+        return rc;
+    }
+
+    return ngx_http_next_header_filter(r);
+}
+
+```
 
 
-
- 
