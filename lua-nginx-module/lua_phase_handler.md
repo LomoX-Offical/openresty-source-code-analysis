@@ -16,7 +16,9 @@ Lua 在初始化过程中的调用咱们都有大致的了解了，但仅仅是�
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       (void *) ngx_http_lua_rewrite_handler_inline },
+
 ```
+
 能看出来 rewrite_by_lua 跟 init_by_lua 不一样的地方是，允许在 main ，server ， location ， if 上下文中使用，可以看出 rewrite_by_lua 的使用将会比 init_by_lua* 更加灵活。
 从 ngx_http_lua_init 函数代码分析我们可以得知， rewrite_by_lua 指令定义的 Lua 代码，首先是把 ngx_http_lua_rewrite_handler 插入到 cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers 列表中，在一个请求处理的 rewrite 阶段被执行。
 那么被插入的 ngx_http_lua_rewrite_handler 函数具体的实现了什么：
@@ -260,6 +262,7 @@ ngx_http_lua_rewrite_by_lua(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     return NGX_CONF_OK;
 }
+
 ```
 
 ngx_http_lua_rewrite_by_lua 函数，在处理 rewrite_by_lua* 指令时在 location 的配置结构上设置了 rewrite_handler 的回调，计算了 Lua 代码的 cache_key，然后在请求处理的 rewrite 阶段，通过这些回调处理指令输入的 Lua 代码，执行结果对 rewrite 阶段产生影响。
@@ -273,7 +276,7 @@ ngx_http_lua_rewrite_by_lua 函数，在处理 rewrite_by_lua* 指令时在 loca
 *  content_by_lua* 上的 Lua 代码用于内容生成逻辑。
 *  log_by_lua* 上的 Lua 代码用于写日志之后做剩余收尾逻辑，比如说统计或者其他的。
 
-access_by_lua*，这个阶段大部分与 rewrite_by_lua*类似，大致流程是这样的：
+access_by_lua\*，这个阶段大部分与 rewrite_by_lua*类似，大致流程是这样的：
 
 配置读取阶段(ngx_http_lua_access_by_lua)： 
 *  根据 Lua 代码字符串计算 cache_key
@@ -341,14 +344,17 @@ ngx_http_lua_header_filter(ngx_http_request_t *r)
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
 
+    // 上下文状态入栈
     old_context = ctx->context;
     ctx->context = NGX_HTTP_LUA_CONTEXT_HEADER_FILTER;
 
     // 调用 filter 的 Lua 代码 
     rc = llcf->header_filter_handler(r);
 
+    // 上下文状态出栈
     ctx->context = old_context;
 
+    // 根据 Lua 运行结果决定，是返回还是跑下去。
     if (rc == NGX_DECLINED) {
         return NGX_OK;
     }
@@ -357,9 +363,230 @@ ngx_http_lua_header_filter(ngx_http_request_t *r)
         return rc;
     }
 
+    // 跑下一个 filter 
     return ngx_http_next_header_filter(r);
 }
 
 ```
 
+就如其他 filter 一样， ngx_http_lua_header_filter 要做的就是根据运行情况决定 header 的内容，流程是否发往下一个 filter 处理，还是直接终止。
+在这个环境里边， llcf->header_filter_handler 指针其实是指向 ngx_http_lua_header_filter_inline 或者 ngx_http_lua_header_filter_file，与 rewrite_by_lua* 等指令流程基本相同，这里不一一展开了。
 
+而在 body 的 filter 中：
+
+```c
+
+static ngx_int_t
+ngx_http_lua_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
+{
+    // 无内容，直接交给下一 filter 处理
+    if (in == NULL) {
+        return ngx_http_next_body_filter(r, in);
+    }
+
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_lua_module);
+
+    if (llcf->body_filter_handler == NULL) {
+        // 如果 location 没指定 Lua 代码，跳过本 filter
+        return ngx_http_next_body_filter(r, in);
+    }
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
+
+    if (ctx->seen_last_in_filter) {
+        // 这是最后阶段，直接抛出
+        for (/* void */; in; in = in->next) {
+            in->buf->pos = in->buf->last;
+            in->buf->file_pos = in->buf->file_last;
+        }
+
+        return NGX_OK;
+    }
+
+    
+    // 上下文状态入栈
+    old_context = ctx->context;
+    ctx->context = NGX_HTTP_LUA_CONTEXT_BODY_FILTER;
+
+    // 调用 filter 的 Lua 代码 
+    rc = llcf->body_filter_handler(r, in);
+
+    // 上下文状态出栈
+    ctx->context = old_context;
+
+    // 处理错误情况
+    if (rc != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    // 从 Lua 状态机取出要交给下一个 filter 处理的数据 out
+    L = ngx_http_lua_get_lua_vm(r, ctx);
+    lua_getglobal(L, ngx_http_lua_chain_key);
+    out = lua_touserdata(L, -1);
+    lua_pop(L, 1);
+
+    rc = ngx_http_next_body_filter(r, out);
+
+    // 整理并释放 ngx_http_lua_module 上下文中的 chain 的内存资源
+    ngx_chain_update_chains(r->pool,
+                            &ctx->free_bufs, &ctx->busy_bufs, &out,
+                            (ngx_buf_tag_t) &ngx_http_lua_module);
+
+    return rc;
+}
+```
+
+就如其他 filter 一样， ngx_http_lua_body_filter 要做的就是根据 输入内存链表 in ，计算输出内容 out ，并发往下一个 filter 处理。
+在这个环境里边， llcf->body_filter_handler 指针其实是指向 ngx_http_lua_body_filter_inline 或者 ngx_http_lua_body_filter_file ，与 rewrite_by_lua* 等指令流程基本相同，这里不一一展开了。
+
+## set_by_lua*
+
+最后，我们还剩下一个 set_by_lua* 系列指令还没谈到。这个系列指令的实现依赖 NDK 库，在 Openresty 的编译环境中当然是有 NDK 了。
+指令定义是如下：
+
+```c
+
+#if defined(NDK) && NDK
+    /* set_by_lua $res <inline script> [$arg1 [$arg2 [...]]] */
+    { ngx_string("set_by_lua"),
+      NGX_HTTP_SRV_CONF|NGX_HTTP_SIF_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
+                       |NGX_CONF_2MORE,
+      ngx_http_lua_set_by_lua,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      (void *) ngx_http_lua_filter_set_by_lua_inline },
+
+    /* set_by_lua_file $res rel/or/abs/path/to/script [$arg1 [$arg2 [..]]] */
+    { ngx_string("set_by_lua_file"),
+      NGX_HTTP_SRV_CONF|NGX_HTTP_SIF_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF
+                       |NGX_CONF_2MORE,
+      ngx_http_lua_set_by_lua_file,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      (void *) ngx_http_lua_filter_set_by_lua_file },
+#endif
+
+```
+这个指令的使用上下文比其他系列指令更宽泛，允许在 NGX_HTTP_SIF_CONF 上使用，而且可以允许传入2个以上参数，这也是在参考了 set 指令的属性后得出的结果。
+咱们先看 ngx_http_lua_set_by_lua 函数：
+
+```c
+char *
+ngx_http_lua_set_by_lua(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+
+    /*
+     * value[0] = "set_by_lua"
+     * value[1] = target variable name
+     * value[2] = lua script source to be executed
+     * value[3..] = real params
+     * */
+    value = cf->args->elts;
+    target = value[1];
+
+    filter.type = NDK_SET_VAR_MULTI_VALUE_DATA;
+    
+    // 把 Lua 处理函数塞到 filter 结构体中
+    filter.func = cmd->post;
+    filter.size = cf->args->nelts - 3;    /*  get number of real params */
+
+    filter_data = ngx_palloc(cf->pool, sizeof(ngx_http_lua_set_var_data_t));
+    filter_data->size = filter.size;
+
+    // 计算 cache_key 的名字
+    p = ngx_palloc(cf->pool, NGX_HTTP_LUA_INLINE_KEY_LEN + 1);
+    filter_data->key = p;
+    p = ngx_copy(p, NGX_HTTP_LUA_INLINE_TAG, NGX_HTTP_LUA_INLINE_TAG_LEN);
+    p = ngx_http_lua_digest_hex(p, value[2].data, value[2].len);
+    *p = '\0';
+
+    filter_data->script = value[2];
+
+    filter.data = filter_data;
+
+    // 丢到这个复杂的变量系统中
+    return ndk_set_var_multi_value_core(cf, &target, &value[3], &filter);
+}
+
+```
+
+在 ndk_set_var_multi_value_core 经过配置处理之后，在请求到来的时候，复杂的变量系统会在 rewrite 阶段执行这个变量系统的回调，也就是 ngx_http_lua_filter_set_by_lua_inline
+
+```c
+ngx_int_t
+ngx_http_lua_filter_set_by_lua_inline(ngx_http_request_t *r, ngx_str_t *val,
+    ngx_http_variable_value_t *v, void *data)
+{
+    lua_State                   *L;
+    ngx_int_t                    rc;
+
+    ngx_http_lua_set_var_data_t     *filter_data = data;
+
+    // 这里把上下文给初始化了，具体代码见下面
+    if (ngx_http_lua_set_by_lua_init(r) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    // 获取 Lua 虚拟机，挂载 Lua 代码块到虚拟机上
+    L = ngx_http_lua_get_lua_vm(r, NULL);
+    rc = ngx_http_lua_cache_loadbuffer(r, L, filter_data->script.data,
+                                       filter_data->script.len,
+                                       filter_data->key, "=set_by_lua");
+
+    // 运行 Lua 代码块，根据输入的变量列表计算出输出变量的结果
+    rc = ngx_http_lua_set_by_chunk(L, r, val, v, filter_data->size,
+                                   &filter_data->script);
+    if (rc != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_lua_set_by_lua_init(ngx_http_request_t *r)
+{
+    ctx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
+    if (ctx == NULL) {
+        ctx = ngx_http_lua_create_ctx(r);
+    } else {
+        L = ngx_http_lua_get_lua_vm(r, ctx);
+        ngx_http_lua_reset_ctx(r, L, ctx);
+    }
+
+    if (ctx->cleanup == NULL) {
+        cln = ngx_http_cleanup_add(r, 0);
+        if (cln == NULL) {
+            return NGX_ERROR;
+        }
+
+        cln->handler = ngx_http_lua_request_cleanup_handler;
+        cln->data = ctx;
+        ctx->cleanup = &cln->handler;
+    }
+
+    ctx->context = NGX_HTTP_LUA_CONTEXT_SET;
+    return NGX_OK;
+}
+```
+
+在代码中可以看到，与其他指令不一样的地方就是调用了 ngx_http_lua_set_by_chunk 函数，这个函数是该指令最核心的代码了，负责运行 Lua 代码块，根据输入的变量列表计算出输出变量的结果。
+
+##总结
+
+本节我们开了个头，把植入 Lua 代码的指令基本逻辑流程都描述了一遍，有一些相同的流程，比如：
+*  在不同阶段插入 handler，或者 filter。
+*  为了提高运行效率，计算 cache_key ，并且使用 cache_key 去缓存 Lua 代码块
+*  利用上下文结构体去把自己的流程分开不同的状态
+*  在运行 Lua 代码前，把上下文状态入栈，在 Lua 代码运行完之后把上下文状态出栈。
+*  获取虚拟机并把代码块入栈，把 traceback 函数作为错误处理回调放入 Lua 虚拟机，并使用 pcall 执行 Lua 代码块。 
+
+等等。
+
+而其差异是因为各自所在的阶段以及自身要实现的功能而有所不同：
+*  插入 handler 或者 filter 的实际地方不一样
+*  handler 和 filter 在构造的 ctx 不一样
+*  运行 Lua 代码之前，会根据自身要实现的功能把一些结构体内容压栈到虚拟机，这些内容也各不相同。
+*  Lua 代码运行结束后，对其结果的处理手段也不一样
+
+运行 Lua 代码之前，根据自身要实现的功能把一些结构体内容压栈到虚拟机这一块我们目前还没有深入分析，请看下一节。
