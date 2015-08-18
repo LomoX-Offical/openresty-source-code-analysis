@@ -88,70 +88,24 @@ ngx_http_lua_cache_loadbuffer(ngx_http_request_t *r, lua_State *L,
         return NGX_OK;
     }
 
-    if (rc == NGX_ERROR) {
-        return NGX_ERROR;
-    }
-
-    /* rc == NGX_DECLINED */
-
-    dd("Code cache missed! cache key='%s', stack top=%d, script='%.*s'",
-       cache_key, lua_gettop(L), (int) src_len, src);
-
-    /* load closure factory of inline script to the top of lua stack, sp++ */
+    // 从字符串 src 生成 Lua 代码块
     rc = ngx_http_lua_clfactory_loadbuffer(L, (char *) src, src_len, name);
-
-    if (rc != 0) {
-        /*  Oops! error occured when loading Lua script */
-        if (rc == LUA_ERRMEM) {
-            err = "memory allocation error";
-
-        } else {
-            if (lua_isstring(L, -1)) {
-                err = lua_tostring(L, -1);
-
-            } else {
-                err = "unknown error";
-            }
-        }
-
-        goto error;
-    }
-
-    /*  store closure factory and gen new closure at the top of lua stack to
-     *  code cache */
+    
+    // 把 Lua 代码块以 cache_key 作为索引保存起来。
     rc = ngx_http_lua_cache_store_code(L, (char *) cache_key);
-    if (rc != NGX_OK) {
-        err = "fail to generate new closure from the closure factory";
-        goto error;
-    }
-
+    
     return NGX_OK;
-
-error:
-
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "failed to load inlined Lua code: %s", err);
-    lua_settop(L, n);
-    return NGX_ERROR;
 }
 
 static ngx_int_t
 ngx_http_lua_cache_load_code(ngx_http_request_t *r, lua_State *L,
     const char *key)
 {
-    // 把 ngx_http_lua_code_cache_key 的地址入栈，http://blog.codingnow.com/2006/11/lua_c.html
+    // 从 registry 全局注册表，找 ngx_http_lua_code_cache_key 的地址作为索引的值，并且把值入栈
     lua_pushlightuserdata(L, &ngx_http_lua_code_cache_key);
-    
-    // 把
-    lua_rawget(L, LUA_REGISTRYINDEX);    /*  sp++ */
+    lua_rawget(L, LUA_REGISTRYINDEX);   /*  sp++ */
 
-    dd("Code cache table to load: %p", lua_topointer(L, -1));
-
-    if (!lua_istable(L, -1)) {
-        dd("Error: code cache table to load did not exist!!");
-        return NGX_ERROR;
-    }
-
+    // 这个值其实是一个 table ， 用于存储 Lua 代码块数据，现在以 key 为索引对 table 进行查找并把结果入栈
     lua_getfield(L, -1, key);    /*  sp++ */
 
     if (lua_isfunction(L, -1)) {
@@ -178,10 +132,6 @@ ngx_http_lua_cache_load_code(ngx_http_request_t *r, lua_State *L,
         return NGX_ERROR;
     }
 
-    dd("Value associated with given key in code cache table is not code "
-       "chunk: stack top=%d, top value type=%s\n",
-       lua_gettop(L), lua_typename(L, -1));
-
     /*  remove cache table and value from stack */
     lua_pop(L, 2);                                /*  sp-=2 */
 
@@ -190,6 +140,8 @@ ngx_http_lua_cache_load_code(ngx_http_request_t *r, lua_State *L,
 
 
 ```
+这个是一个获取保存在 Lua 虚拟机的 C 函数使用全局变量的方法，key 是 ngx_http_lua_code_cache_key 的地址（独一无二）
+
 
 然而其实我们还不知道 ngx_http_lua_body_filter_by_chunk 里边究竟发生了什么：
 
