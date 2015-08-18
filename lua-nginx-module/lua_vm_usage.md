@@ -72,5 +72,228 @@ ngx_http_lua_body_filter_inline(ngx_http_request_t *r, ngx_chain_t *in)
 
 现在看来代码结构是多么的熟悉，先把 Lua 虚拟机从 location 配置中读出来，再根据 cache_key 寻找对应的代码块缓存并入栈 Lua 虚拟机，最后通过 ngx_http_lua_body_filter_by_chunk 执行 Lua 代码。
 
+然而，我们其实还没了解 ngx_http_lua_cache_loadbuffer 是怎么实现的：
+
+```c
+ngx_int_t
+ngx_http_lua_cache_loadbuffer(ngx_http_request_t *r, lua_State *L,
+    const u_char *src, size_t src_len, const u_char *cache_key,
+    const char *name)
+{
+    n = lua_gettop(L);
+
+    rc = ngx_http_lua_cache_load_code(r, L, (char *) cache_key);
+    if (rc == NGX_OK) {
+        // 代码块缓存找到并压栈了           
+        return NGX_OK;
+    }
+
+    if (rc == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
+    /* rc == NGX_DECLINED */
+
+    dd("Code cache missed! cache key='%s', stack top=%d, script='%.*s'",
+       cache_key, lua_gettop(L), (int) src_len, src);
+
+    /* load closure factory of inline script to the top of lua stack, sp++ */
+    rc = ngx_http_lua_clfactory_loadbuffer(L, (char *) src, src_len, name);
+
+    if (rc != 0) {
+        /*  Oops! error occured when loading Lua script */
+        if (rc == LUA_ERRMEM) {
+            err = "memory allocation error";
+
+        } else {
+            if (lua_isstring(L, -1)) {
+                err = lua_tostring(L, -1);
+
+            } else {
+                err = "unknown error";
+            }
+        }
+
+        goto error;
+    }
+
+    /*  store closure factory and gen new closure at the top of lua stack to
+     *  code cache */
+    rc = ngx_http_lua_cache_store_code(L, (char *) cache_key);
+    if (rc != NGX_OK) {
+        err = "fail to generate new closure from the closure factory";
+        goto error;
+    }
+
+    return NGX_OK;
+
+error:
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                  "failed to load inlined Lua code: %s", err);
+    lua_settop(L, n);
+    return NGX_ERROR;
+}
+
+static ngx_int_t
+ngx_http_lua_cache_load_code(ngx_http_request_t *r, lua_State *L,
+    const char *key)
+{
+    // 把 ngx_http_lua_code_cache_key 的地址入栈，http://blog.codingnow.com/2006/11/lua_c.html
+    lua_pushlightuserdata(L, &ngx_http_lua_code_cache_key);
+    
+    // 把
+    lua_rawget(L, LUA_REGISTRYINDEX);    /*  sp++ */
+
+    dd("Code cache table to load: %p", lua_topointer(L, -1));
+
+    if (!lua_istable(L, -1)) {
+        dd("Error: code cache table to load did not exist!!");
+        return NGX_ERROR;
+    }
+
+    lua_getfield(L, -1, key);    /*  sp++ */
+
+    if (lua_isfunction(L, -1)) {
+        /*  call closure factory to gen new closure */
+        rc = lua_pcall(L, 0, 1, 0);
+        if (rc == 0) {
+            /*  remove cache table from stack, leave code chunk at
+             *  top of stack */
+            lua_remove(L, -2);   /*  sp-- */
+            return NGX_OK;
+        }
+
+        if (lua_isstring(L, -1)) {
+            err = (u_char *) lua_tostring(L, -1);
+
+        } else {
+            err = (u_char *) "unknown error";
+        }
+
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "lua: failed to run factory at key \"%s\": %s",
+                      key, err);
+        lua_pop(L, 2);
+        return NGX_ERROR;
+    }
+
+    dd("Value associated with given key in code cache table is not code "
+       "chunk: stack top=%d, top value type=%s\n",
+       lua_gettop(L), lua_typename(L, -1));
+
+    /*  remove cache table and value from stack */
+    lua_pop(L, 2);                                /*  sp-=2 */
+
+    return NGX_DECLINED;
+}
+
+
+```
+
+然而其实我们还不知道 ngx_http_lua_body_filter_by_chunk 里边究竟发生了什么：
+
+```c
+ngx_int_t
+ngx_http_lua_body_filter_by_chunk(lua_State *L, ngx_http_request_t *r,
+    ngx_chain_t *in)
+{
+    // 初始化 Lua 虚拟机用于 body filter 的执行环境，见函数定义
+    ngx_http_lua_body_filter_by_lua_env(L, r, in);
+
+    // 很熟悉了， traceback 入栈用于错误处理
+    lua_pushcfunction(L, ngx_http_lua_traceback);
+
+    // 很熟悉了， traceback 函数被往下压， body filter 的代码块被放在栈顶
+    lua_insert(L, 1);
+
+    // 执行 Lua 代码块
+    rc = lua_pcall(L, 0, 1, 1);
+
+    // 从 Lua 虚拟机删除 traceback 函数 
+    lua_remove(L, 1);
+
+    //错误处理
+    if (rc != 0) {
+
+        /*  error occured */
+        err_msg = (u_char *) lua_tolstring(L, -1, &len);
+
+        if (err_msg == NULL) {
+            err_msg = (u_char *) "unknown reason";
+            len = sizeof("unknown reason") - 1;
+        }
+
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "failed to run body_filter_by_lua*: %*s", len, err_msg);
+
+        lua_settop(L, 0);    /*  clear remaining elems on stack */
+
+        return NGX_ERROR;
+    }
+
+    rc = (ngx_int_t) lua_tointeger(L, -1);
+    lua_settop(L, 0);
+
+    if (rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_lua_body_filter_by_lua_env(lua_State *L, ngx_http_request_t *r,
+    ngx_chain_t *in)
+{
+    // 把 request 请求结构体压入 Lua 虚拟机，请看函数定义
+    ngx_http_lua_set_req(L, r);
+
+    // 把数据链表结构体作为 ngx_http_lua_chain_key ( 全局变量名）压入 Lua 虚拟机
+    lua_pushlightuserdata(L, in);
+    lua_setglobal(L, ngx_http_lua_chain_key);
+
+    // 在栈顶创建一个 table 这里标记为@1 ，并在这个 table 创建名为 _G 的字段并赋值新的 table
+    ngx_http_lua_create_new_globals_table(L, 0 /* narr */, 1 /* nrec */);
+
+    // 在栈顶创建一个 table 这里标记为@2 ，并把全局变量数组塞进这个 table 的 __index 字段中
+    lua_createtable(L, 0, 1 /* nrec */);
+    ngx_http_lua_get_globals_table(L);
+    lua_setfield(L, -2, "__index");
+    
+    // 把栈顶的 table 即 @2 出栈，并把 @2 作为 @1 的元表
+    lua_setmetatable(L, -2);
+
+    // 把 @1 作为新的环境数据写入 Lua 虚拟机
+    lua_setfenv(L, -2);
+}
+
+static ngx_inline void
+ngx_http_lua_set_req(lua_State *L, ngx_http_request_t *r)
+{
+    lua_pushlightuserdata(L, r);
+    lua_setglobal(L, ngx_http_lua_req_key);
+}
+
+
+void
+ngx_http_lua_create_new_globals_table(lua_State *L, int narr, int nrec)
+{
+    lua_createtable(L, narr, nrec + 1);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, -2, "_G");
+}
+
+static ngx_inline void
+ngx_http_lua_get_globals_table(lua_State *L)
+{
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
+}
+
+```
+
+ngx_http_lua_body_filter_by_lua_env 刚开始看得云里雾里，在下也是刚开始接触 Lua 虚拟机编程，对 Lua 虚拟机的出栈入栈比较头大，但看着看着也慢慢可以分析一下代码了，这里也建议读者您千万别放弃这个学习的机会。
+
+好了我们言归正传， ngx_http_lua_body_filter_by_lua_env 看最终要实现的功能就是, 把 request 结构体数据以及输入数据链 chain 作为全局变量入栈，并且把当前 Lua 虚拟机的全局变量数据带入新创建的环境数据中，之所以要创建新的环境数据，大概是因为作者不希望 Lua 代码执行的结果影响到 Openresty 进程全局的环境数据，而是尽可能的把本次的代码执行结果的影响限制在本次代码执行的环境数据中，达到隔离 Lua 代码执行的效果，从而实现一个安全的执行环境。
 
 
