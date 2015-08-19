@@ -329,7 +329,186 @@ ngx_http_lua_body_filter_by_lua_env 刚开始看得云里雾里，在下也是�
 
 好了我们言归正传， ngx_http_lua_body_filter_by_lua_env 看最终要实现的功能就是, 把 request 结构体数据以及输入数据链 chain 作为全局变量入栈，并且把当前 Lua 虚拟机的全局变量数据带入新创建的环境数据中，之所以要创建新的环境数据，大概是因为作者不希望 Lua 代码执行的结果影响到 Openresty 进程全局的环境数据，而是尽可能的把本次的代码执行结果的影响限制在本次代码执行的环境数据中，达到隔离 Lua 代码执行的效果，从而实现一个安全的执行环境。
 
+## ngx_http_lua_access_by_chunk
+
+filter_by_lua\* 系列指令我们就已经做过代码分析，流程也做了透彻了解，下面我们再看看 access_by_lua\* 系列，因为这个系列比 filter_by_lua\* 系列的代码使用更多 Lua 虚拟机特性，代码也更加复杂。
+
+上一节中我们已经对 access_by_lua\* 的基本流程做了解释，剩下 ngx_http_lua_access_by_chunk 没有展开，有了前面我们对 ngx_http_lua_body_filter_inline 和 ngx_http_lua_body_filter_by_chunk 的解读作为基础，阅读 ngx_http_lua_access_by_chunk 函数的代码将会更顺利。 
+回顾 ngx_http_lua_access_handler_inline 一下基本流程：
+*  在请求到来时，先通过 ngx_http_lua_get_lua_vm 获取到 Lua 虚拟机
+*  再通过 ngx_http_lua_cache_loadbuffer 获取代码缓存并入栈，在本节前文中我们已经了解代码缓存的存取了。
+*  调用 ngx_http_lua_access_by_chunk 函数执行 access_by_lua* 指令指定的 Lua 代码并根据其结果调整处理流程。
+
+```c
+ngx_int_t
+ngx_http_lua_access_handler_inline(ngx_http_request_t *r)
+{
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_lua_module);
+    L = ngx_http_lua_get_lua_vm(r, NULL);
+    rc = ngx_http_lua_cache_loadbuffer(r, L, llcf->access_src.value.data,
+                                       llcf->access_src.value.len,
+                                       llcf->access_src_key,
+                                       (const char *) llcf->access_chunkname);
+    return ngx_http_lua_access_by_chunk(L, r);
+}
+```
+
+下面我们看看 ngx_http_lua_access_by_chunk 函数的细节：
+
+```c
+static ngx_int_t
+ngx_http_lua_access_by_chunk(lua_State *L, ngx_http_request_t *r)
+{
+    int                  co_ref;
+    ngx_int_t            rc;
+    lua_State           *co;
+    ngx_connection_t    *c;
+    ngx_http_lua_ctx_t  *ctx;
+    ngx_http_cleanup_t  *cln;
+
+    ngx_http_lua_loc_conf_t     *llcf;
+
+    // 为这个请求创建新协程
+    co = ngx_http_lua_new_thread(r, L, &co_ref);
+
+    // 把要执行的 Lua 代码块从 Lua 虚拟机 L ，交换到新的协程 Lua 虚拟机 co 上
+    lua_xmove(L, co, 1);
+
+    // 把 co 虚拟机的全局变量数据 table 复制入栈
+    ngx_http_lua_get_globals_table(co);
+    
+    // 奇怪了，为毛是 -2 ，把 XXX 设置为 co 虚拟机的执行环境数据 table
+    lua_setfenv(co, -2);
+
+    // 很熟悉了吧，把 request 请求结构体入栈 co 虚拟机
+    ngx_http_lua_set_req(co, r);
+
+    // 清理 ctx 上下文结构体数据
+    ctx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
+    ngx_http_lua_reset_ctx(r, L, ctx);
+
+    // 配置 ctx 数据
+    ctx->entered_access_phase = 1;
+    ctx->cur_co_ctx = &ctx->entry_co_ctx;
+    ctx->cur_co_ctx->co = co;
+    ctx->cur_co_ctx->co_ref = co_ref;
+#ifdef NGX_LUA_USE_ASSERT
+    ctx->cur_co_ctx->co_top = 1;
+#endif
+    ctx->context = NGX_HTTP_LUA_CONTEXT_ACCESS;
+
+
+
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_lua_module);
+
+    if (llcf->check_client_abort) {
+        r->read_event_handler = ngx_http_lua_rd_check_broken_connection;
+
+    } else {
+        r->read_event_handler = ngx_http_block_reading;
+    }
+
+    // 把 Lua 代码块放在新协程虚拟机上运行
+    rc = ngx_http_lua_run_thread(L, r, ctx, 0);
+
+    if (rc == NGX_ERROR || rc > NGX_OK) {
+        return rc;
+    }
+
+    c = r->connection;
+
+    if (rc == NGX_AGAIN) {
+        rc = ngx_http_lua_run_posted_threads(c, L, r, ctx);
+
+        if (rc == NGX_ERROR || rc == NGX_DONE || rc > NGX_OK) {
+            return rc;
+        }
+
+        if (rc != NGX_OK) {
+            return NGX_DECLINED;
+        }
+
+    } else if (rc == NGX_DONE) {
+        ngx_http_lua_finalize_request(r, NGX_DONE);
+
+        rc = ngx_http_lua_run_posted_threads(c, L, r, ctx);
+
+        if (rc == NGX_ERROR || rc == NGX_DONE || rc > NGX_OK) {
+            return rc;
+        }
+
+        if (rc != NGX_OK) {
+            return NGX_DECLINED;
+        }
+    }
+
+#if 1
+    if (rc == NGX_OK) {
+        if (r->header_sent) {
+            dd("header already sent");
+
+            /* response header was already generated in access_by_lua*,
+             * so it is no longer safe to proceed to later phases
+             * which may generate responses again */
+
+            if (!ctx->eof) {
+                dd("eof not yet sent");
+
+                rc = ngx_http_lua_send_chain_link(r, ctx, NULL
+                                                  /* indicate last_buf */);
+                if (rc == NGX_ERROR || rc > NGX_OK) {
+                    return rc;
+                }
+            }
+
+            return NGX_HTTP_OK;
+        }
+
+        return NGX_OK;
+    }
+#endif
+
+    return NGX_DECLINED;
+}
+
+lua_State *
+ngx_http_lua_new_thread(ngx_http_request_t *r, lua_State *L, int *ref)
+{
+    int              base;
+    lua_State       *co;
+
+    // 记一个 top 的索引
+    base = lua_gettop(L);
+
+    // 使用 ngx_http_lua_coroutines_key 的地址作为索引，在 register 全局注册表中找到 corutine_table 入栈
+    lua_pushlightuserdata(L, &ngx_http_lua_coroutines_key);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+
+    // 用 Lua 虚拟机 L 创建一条新协程，并将其压栈，并返回维护这个线程的 lua_State 赋值给 co
+    co = lua_newthread(L);
+
+    // 在 co 虚拟机重新设定全局变量表，并出栈
+    ngx_http_lua_create_new_globals_table(co, 0, 0);
+    lua_createtable(co, 0, 1);
+    ngx_http_lua_get_globals_table(co);
+    lua_setfield(co, -2, "__index");
+    lua_setmetatable(co, -2);
+    ngx_http_lua_set_globals_table(co);
+
+    // 回到 Lua 虚拟机 L ，把 co 这个栈顶协程引用到 corutine_table ，并得到 ref 作为引用索引
+    *ref = luaL_ref(L, -2);
+    
+    // 完成所有操作了，删除 base 之上的数据，恢复栈状态
+    lua_settop(L, base);
+    return co;
+}
+
+
+
+```
+
+
+
+
+
 看来已经差不多了解整个流程了，但是像 request 请求结构体以及 chain 数据链结构体，流程中只是使用 lua_pushlightuserdata 函数把它们作为指针入栈到 Lua 虚拟机而已，在 Lua 代码的执行过程中，这些数据会怎么样使用呢？
-
-##
-
