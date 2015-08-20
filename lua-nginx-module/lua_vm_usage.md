@@ -297,7 +297,7 @@ ngx_http_lua_body_filter_by_lua_env(lua_State *L, ngx_http_request_t *r,
     // 把栈顶的 table 即 @2 出栈，并把 @2 作为 @1 的元表
     lua_setmetatable(L, -2);
 
-    // 把 @1 作为新的环境数据写入 Lua 虚拟机
+    // 把 @1 作为 Lua 虚拟机栈顶的 Lua 代码块的新环境数据 table
     lua_setfenv(L, -2);
 }
 
@@ -371,13 +371,13 @@ ngx_http_lua_access_by_chunk(lua_State *L, ngx_http_request_t *r)
     // 为这个请求创建新协程
     co = ngx_http_lua_new_thread(r, L, &co_ref);
 
-    // 把要执行的 Lua 代码块从 Lua 虚拟机 L ，交换到新的协程 Lua 虚拟机 co 上
+    // 把要执行的 Lua 代码块从 Lua 虚拟机 L 出栈，并入栈到新的协程 Lua 虚拟机 co 上
     lua_xmove(L, co, 1);
 
     // 把 co 虚拟机的全局变量数据 table 复制入栈
     ngx_http_lua_get_globals_table(co);
     
-    // 奇怪了，为毛是 -2 ，把 XXX 设置为 co 虚拟机的执行环境数据 table
+    // 把栈顶的 全局变量 table 设置为 Lua 代码块的环境数据 table
     lua_setfenv(co, -2);
 
     // 很熟悉了吧，把 request 请求结构体入栈 co 虚拟机
@@ -397,77 +397,42 @@ ngx_http_lua_access_by_chunk(lua_State *L, ngx_http_request_t *r)
 #endif
     ctx->context = NGX_HTTP_LUA_CONTEXT_ACCESS;
 
-
-
     llcf = ngx_http_get_module_loc_conf(r, ngx_http_lua_module);
-
     if (llcf->check_client_abort) {
+        // 请求中断了跳出
         r->read_event_handler = ngx_http_lua_rd_check_broken_connection;
 
     } else {
+        // 请求没中断，那么先阻塞读操作
         r->read_event_handler = ngx_http_block_reading;
     }
 
     // 把 Lua 代码块放在新协程虚拟机上运行
     rc = ngx_http_lua_run_thread(L, r, ctx, 0);
 
-    if (rc == NGX_ERROR || rc > NGX_OK) {
-        return rc;
-    }
-
     c = r->connection;
-
     if (rc == NGX_AGAIN) {
+        // Lua 代码让出了，等待下一次运行时机，接着跑这个 request 子协程
         rc = ngx_http_lua_run_posted_threads(c, L, r, ctx);
-
-        if (rc == NGX_ERROR || rc == NGX_DONE || rc > NGX_OK) {
-            return rc;
-        }
-
-        if (rc != NGX_OK) {
-            return NGX_DECLINED;
-        }
-
     } else if (rc == NGX_DONE) {
+        // Lua 代码要求结束请求，接着跑这个 request 子协程
         ngx_http_lua_finalize_request(r, NGX_DONE);
-
         rc = ngx_http_lua_run_posted_threads(c, L, r, ctx);
-
-        if (rc == NGX_ERROR || rc == NGX_DONE || rc > NGX_OK) {
-            return rc;
-        }
-
-        if (rc != NGX_OK) {
-            return NGX_DECLINED;
-        }
     }
 
-#if 1
     if (rc == NGX_OK) {
+        // Lua 代码处理结束
         if (r->header_sent) {
-            dd("header already sent");
-
-            /* response header was already generated in access_by_lua*,
-             * so it is no longer safe to proceed to later phases
-             * which may generate responses again */
-
             if (!ctx->eof) {
-                dd("eof not yet sent");
-
-                rc = ngx_http_lua_send_chain_link(r, ctx, NULL
-                                                  /* indicate last_buf */);
-                if (rc == NGX_ERROR || rc > NGX_OK) {
-                    return rc;
-                }
+                // 判断条件，发送 body
+                rc = ngx_http_lua_send_chain_link(r, ctx, NULL);
             }
-
             return NGX_HTTP_OK;
         }
-
         return NGX_OK;
     }
-#endif
 
+    // 让下一个 handler 处理
     return NGX_DECLINED;
 }
 
@@ -504,11 +469,18 @@ ngx_http_lua_new_thread(ngx_http_request_t *r, lua_State *L, int *ref)
 }
 
 
-
 ```
 
+看来已经差不多了解整个流程了，其他阶段的植入 Lua 代码的指令基本也就是这个流程，关键点在于：
+*  从 Lua 虚拟机 L 复制一个新的虚拟机 co 协程
+*  对新协程 co 进行全局数据 table 初始化
+*  把要执行的代码块入栈新协程 co
+*  设置好新协程 co 栈顶的代码块的环境数据
+*  把 co 设置成 entry_co_ctx 入口协程，并且插入到协程链表中
+*  通过 ngx_http_lua_run_thread 执行 co 协程
+*  根据协程处理结果做不同的结束逻辑（每个阶段根据要实现的内容，逻辑有所不同）
 
-
-
-
-看来已经差不多了解整个流程了，但是像 request 请求结构体以及 chain 数据链结构体，流程中只是使用 lua_pushlightuserdata 函数把它们作为指针入栈到 Lua 虚拟机而已，在 Lua 代码的执行过程中，这些数据会怎么样使用呢？
+但是还有几个疑问：
+*  像 request 请求结构体以及 chain 数据链结构体，流程中只是使用 lua_pushlightuserdata 函数把它们作为指针入栈到 Lua 虚拟机而已，在 Lua 代码的执行过程中，这些数据会怎么样使用呢？这个请查看 struct usage 章节。
+*  ngx_http_lua_run_thread 内部怎么实现的？请查看 thread 和 coroutine 章节
+ 
