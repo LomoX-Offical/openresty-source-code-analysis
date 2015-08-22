@@ -67,4 +67,46 @@ end
 
 ```
 
-我们看到 local r = getfenv(0).__ngx_req ，获取 __ngx_req 并保存在变量 r 中，在函数的最后，调用了 C.ngx_http_lua_ffi_req_start_time(r) ，这个函数
+我们看到 local r = getfenv(0).__ngx_req ，获取 __ngx_req 并保存在变量 r 中，在函数的最后，调用了 C.ngx_http_lua_ffi_req_start_time(r) 。
+C 这个变量的定义在这里：
+
+```lua
+
+local C = ffi.C
+
+ffi.cdef[[
+    typedef struct {
+        ngx_http_lua_ffi_str_t   key;
+        ngx_http_lua_ffi_str_t   value;
+    } ngx_http_lua_ffi_table_elt_t;
+
+    int ngx_http_lua_ffi_req_get_headers_count(ngx_http_request_t *r,
+        int max);
+
+    int ngx_http_lua_ffi_req_get_headers(ngx_http_request_t *r,
+        ngx_http_lua_ffi_table_elt_t *out, int count, int raw);
+
+    int ngx_http_lua_ffi_req_get_uri_args_count(ngx_http_request_t *r,
+        int max);
+
+    size_t ngx_http_lua_ffi_req_get_querystring_len(ngx_http_request_t *r);
+
+    int ngx_http_lua_ffi_req_get_uri_args(ngx_http_request_t *r,
+        unsigned char *buf, ngx_http_lua_ffi_table_elt_t *out, int count);
+
+    double ngx_http_lua_ffi_req_start_time(ngx_http_request_t *r);
+
+    int ngx_http_lua_ffi_req_get_method(ngx_http_request_t *r);
+
+    int ngx_http_lua_ffi_req_get_method_name(ngx_http_request_t *r,
+        char *name, size_t *len);
+
+    int ngx_http_lua_ffi_req_set_method(ngx_http_request_t *r, int method);
+
+    int ngx_http_lua_ffi_req_header_set_single_value(ngx_http_request_t *r,
+        const unsigned char *key, size_t key_len, const unsigned char *value,
+        size_t value_len);
+]];
+
+```
+
