@@ -110,3 +110,42 @@ ffi.cdef[[
 
 ```
 
+这里要解释一下 ffi.C 的功能。在 http://luajit.org/ 官方API文档上，我们可以得知，ffi.C 是一个 C 语言基础库的命名空间， Lua 通过访问 ffi.C 可以调用 C 语言的基础库提供的函数，不同的系统实现和最终提供的函数列表又有一些区别：
+*  在 POSIX 系统上（比如 Linux 或者大多数 Unix 、BSD 系统），通过 ffi.C 可以访问到：
+    *  libc, libm, libdl (仅在 Linux ), libgcc (如果 Luajit 是使用 GCC 编译的话) 等基础依赖库的 API 函数，
+    *  宿主程序本身的所有导出函数，
+    *  以及 Luajit 自身提供的 API 函数。
+*  在 windows 系统上，通过 ffi.C 可以访问到：
+    *  宿主程序本身的所有导出函数，
+    *  Luajit 自身提供的 API 函数，
+    *  Luajit 依赖的基础动态库（比如 msvcrt*.dll, kernel32.dll, user32.dll and gdi32.dll 等）的 API 函数。
+    
+而在通过 ffi.C 访问这一系列 API 之前，必须通过 ffi.cdef 接口声明 C 函数，在我们上例代码中，可以看到 ngx_http_lua_ffi_req_start_time 出现在 ffi.cdef 语句的函数声明列表之中。
+
+在这样的声明语句之后，我们就可以通过 C.ngx_http_lua_ffi_req_start_time(r) 的方式调用 C 函数 ngx_http_lua_ffi_req_start_time ，并把 r 作为参数传入这个 C 函数中。
+
+那么 Lua 代码中所使用的 ngx_http_lua_ffi_req_start_time 函数到底在哪里定义呢？
+我们通过翻查 lua-nginx-module 的代码，又可以找到 ngx_http_lua_time.c 这个文件中的一个函数定义：
+
+```c
+double
+ngx_http_lua_ffi_req_start_time(ngx_http_request_t *r)
+{
+    return r->start_sec + r->start_msec / 1000.0;
+}
+
+```
+
+由此可见，是 lua-nginx-module 导出并提供了这个 ngx_http_lua_ffi_req_start_time 函数给 Lua 代码调用。
+
+整理一下顺序：
+
+*  我们通过在 Lua 虚拟机执行 Lua 代码块之前，先对 Lua 虚拟机执行 ngx_http_lua_set_req(L, r) 把 request 请求结构体以指针方式设置进全局变量 __ngx_req 中，
+*  在 Lua 虚拟机执行 Lua 代码块的时候， Lua 代码可以不可以直接访问 request 的成员，但可以通过调用 ngx.req.start_time() 等一系列 Lua 函数间接使用了刚赋值到全局变量 __ngx_req 的 reqeust 请求结构体指针，
+*  在 ngx.req.start_time() 函数执行过程中， 会通过 ffi.C 调用 C 函数 ngx_http_lua_ffi_req_start_time ，并把 request 请求结构体指针作为参数传入该 C 函数中。
+*  在 lua-nginx-module 的 ngx_http_lua_ffi_req_start_time 函数通过实参 request 结构体的指针，计算出返回值完成这个获取请求开始时间戳的功能。
+
+其他的功能实现如果需要访问 request 请求结构体去完成功能，都是以这种类似 ngx.req.start_time() 的方法去间接使用 request 请求结构体。
+
+
+## todo 是在没办法编下去了

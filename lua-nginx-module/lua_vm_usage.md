@@ -484,3 +484,5 @@ ngx_http_lua_new_thread(ngx_http_request_t *r, lua_State *L, int *ref)
 *  像 request 请求结构体以及 chain 数据链结构体，流程中只是使用 lua_pushlightuserdata 函数把它们作为指针入栈到 Lua 虚拟机而已，在 Lua 代码的执行过程中，这些数据会怎么样使用呢？这个请查看 struct usage 章节。
 *  ngx_http_lua_run_thread 内部怎么实现的？请查看 thread 和 coroutine 章节
  
+## 特性
+
