@@ -247,5 +247,63 @@
 这些 API 以及常量可以使得 Lua 能渗透到 nginx 业务逻辑的方方面面，我们利用这些 API 以及常量能轻松对请求的信息以及应答的信息进行操作。
 那么这些 API 以及常量是怎么提供的呢？
 
-## 定义
+## inject
 
+回顾一下我们之前分析过 ngx_http_lua_init 函数吧，它在模块 postconfiguration 阶段被调用，它的功能除了事先就往各个阶段插入 handler、调用了 lmcf->init_handler 回调函数之外，它还调用了 ngx_http_lua_init_vm 函数去初始化 Lua 虚拟机，这里我们对初始化 Lua 虚拟机的这个 ngx_http_lua_init_vm 函数进行展开。
+
+```c
+
+lua_State *
+ngx_http_lua_init_vm(lua_State *parent_vm, ngx_cycle_t *cycle,
+    ngx_pool_t *pool, ngx_http_lua_main_conf_t *lmcf, ngx_log_t *log,
+    ngx_pool_cleanup_t **pcln)
+{
+    // 创建新的 Lua 虚拟机
+    L = ngx_http_lua_new_state(parent_vm, cycle, lmcf, log);
+    if (L == NULL) {
+        return NULL;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0, "lua initialize the "
+                   "global Lua VM %p", L);
+
+    /* register cleanup handler for Lua VM */
+    cln->handler = ngx_http_lua_cleanup_vm;
+
+    state = ngx_alloc(sizeof(ngx_http_lua_vm_state_t), log);
+    if (state == NULL) {
+        return NULL;
+    }
+    state->vm = L;
+    state->count = 1;
+
+    cln->data = state;
+
+    if (pcln) {
+        *pcln = cln;
+    }
+
+    if (lmcf->preload_hooks) {
+
+        /* register the 3rd-party module's preload hooks */
+
+        lua_getglobal(L, "package");
+        lua_getfield(L, -1, "preload");
+
+        hook = lmcf->preload_hooks->elts;
+
+        for (i = 0; i < lmcf->preload_hooks->nelts; i++) {
+
+            ngx_http_lua_probe_register_preload_package(L, hook[i].package);
+
+            lua_pushcfunction(L, hook[i].loader);
+            lua_setfield(L, -2, (char *) hook[i].package);
+        }
+
+        lua_pop(L, 2);
+    }
+
+    return L;
+}
+
+```
