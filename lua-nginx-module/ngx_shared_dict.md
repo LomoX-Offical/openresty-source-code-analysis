@@ -282,14 +282,14 @@ ngx_http_lua_inject_shdict_api(ngx_http_lua_main_conf_t *lmcf, lua_State *L)
             lua_setmetatable(L, -2);
             
             //  t1[key] = value
-            lua_rawset(L, -4); /* shared mt */
+            lua_rawset(L, -4);
         }
 
         // 把 metatable 出栈
-        lua_pop(L, 1); /* shared */
+        lua_pop(L, 1);
 
     } else {
-        lua_newtable(L);    /* ngx.shared */
+        lua_newtable(L); 
     }
 
     // 外部的 ngx table， ngx["shared"] = t1
@@ -301,7 +301,462 @@ ngx_http_lua_inject_shdict_api(ngx_http_lua_main_conf_t *lmcf, lua_State *L)
 这里的 api 实现并不是直接放在 ngx.shared 上，而是把 shared 作为一个 table ，里边有各种带名字的共享内存字典对象，这些对象存储了一个共享内存数据结构地址，并且继承了 __index 可以索引到 13 个函数 api 。
 然后后面对会围绕着这个共享内存数据结构地址 zone[i] 展开进行操作。
 
+# set
+ngx.shared.DICT 的其中一个常用的 api 就是 set 了，但除了set api ，其实还包括 add ， safe_add ， replace ， add ， add ， 
+
+```c
+
+static int
+ngx_http_lua_shdict_add(lua_State *L)
+{
+    return ngx_http_lua_shdict_set_helper(L, NGX_HTTP_LUA_SHDICT_ADD);
+}
+
+
+static int
+ngx_http_lua_shdict_safe_add(lua_State *L)
+{
+    return ngx_http_lua_shdict_set_helper(L, NGX_HTTP_LUA_SHDICT_ADD
+                                          |NGX_HTTP_LUA_SHDICT_SAFE_STORE);
+}
+
+
+static int
+ngx_http_lua_shdict_replace(lua_State *L)
+{
+    return ngx_http_lua_shdict_set_helper(L, NGX_HTTP_LUA_SHDICT_REPLACE);
+}
+
+
+static int
+ngx_http_lua_shdict_set(lua_State *L)
+{
+    return ngx_http_lua_shdict_set_helper(L, 0);
+}
+
+
+static int
+ngx_http_lua_shdict_safe_set(lua_State *L)
+{
+    return ngx_http_lua_shdict_set_helper(L, NGX_HTTP_LUA_SHDICT_SAFE_STORE);
+}
+
+
+static int
+ngx_http_lua_shdict_set_helper(lua_State *L, int flags)
+{
+    int                          i, n;
+    ngx_str_t                    key;
+    uint32_t                     hash;
+    ngx_int_t                    rc;
+    ngx_http_lua_shdict_ctx_t   *ctx;
+    ngx_http_lua_shdict_node_t  *sd;
+    ngx_str_t                    value;
+    int                          value_type;
+    double                       num;
+    u_char                       c;
+    lua_Number                   exptime = 0;
+    u_char                      *p;
+    ngx_rbtree_node_t           *node;
+    ngx_time_t                  *tp;
+    ngx_shm_zone_t              *zone;
+    int                          forcible = 0;
+                         /* indicates whether to foricibly override other
+                          * valid entries */
+    int32_t                      user_flags = 0;
+
+    n = lua_gettop(L);
+
+    if (n != 3 && n != 4 && n != 5) {
+        return luaL_error(L, "expecting 3, 4 or 5 arguments, "
+                          "but only seen %d", n);
+    }
+
+    zone = lua_touserdata(L, 1);
+    if (zone == NULL) {
+        return luaL_error(L, "bad \"zone\" argument");
+    }
+
+    ctx = zone->data;
+
+    if (lua_isnil(L, 2)) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "nil key");
+        return 2;
+    }
+
+    key.data = (u_char *) luaL_checklstring(L, 2, &key.len);
+
+    if (key.len == 0) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "empty key");
+        return 2;
+    }
+
+    if (key.len > 65535) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "key too long");
+        return 2;
+    }
+
+    hash = ngx_crc32_short(key.data, key.len);
+
+    value_type = lua_type(L, 3);
+
+    switch (value_type) {
+    case LUA_TSTRING:
+        value.data = (u_char *) lua_tolstring(L, 3, &value.len);
+        break;
+
+    case LUA_TNUMBER:
+        value.len = sizeof(double);
+        num = lua_tonumber(L, 3);
+        value.data = (u_char *) &num;
+        break;
+
+    case LUA_TBOOLEAN:
+        value.len = sizeof(u_char);
+        c = lua_toboolean(L, 3) ? 1 : 0;
+        value.data = &c;
+        break;
+
+    case LUA_TNIL:
+        if (flags & (NGX_HTTP_LUA_SHDICT_ADD|NGX_HTTP_LUA_SHDICT_REPLACE)) {
+            lua_pushnil(L);
+            lua_pushliteral(L, "attempt to add or replace nil values");
+            return 2;
+        }
+
+        ngx_str_null(&value);
+        break;
+
+    default:
+        lua_pushnil(L);
+        lua_pushliteral(L, "bad value type");
+        return 2;
+    }
+
+    if (n >= 4) {
+        exptime = luaL_checknumber(L, 4);
+        if (exptime < 0) {
+            exptime = 0;
+        }
+    }
+
+    if (n == 5) {
+        user_flags = (uint32_t) luaL_checkinteger(L, 5);
+    }
+
+    ngx_shmtx_lock(&ctx->shpool->mutex);
+
+#if 1
+    ngx_http_lua_shdict_expire(ctx, 1);
+#endif
+
+    rc = ngx_http_lua_shdict_lookup(zone, hash, key.data, key.len, &sd);
+
+    dd("shdict lookup returned %d", (int) rc);
+
+    if (flags & NGX_HTTP_LUA_SHDICT_REPLACE) {
+
+        if (rc == NGX_DECLINED || rc == NGX_DONE) {
+            ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+            lua_pushboolean(L, 0);
+            lua_pushliteral(L, "not found");
+            lua_pushboolean(L, forcible);
+            return 3;
+        }
+
+        /* rc == NGX_OK */
+
+        goto replace;
+    }
+
+    if (flags & NGX_HTTP_LUA_SHDICT_ADD) {
+
+        if (rc == NGX_OK) {
+            ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+            lua_pushboolean(L, 0);
+            lua_pushliteral(L, "exists");
+            lua_pushboolean(L, forcible);
+            return 3;
+        }
+
+        if (rc == NGX_DONE) {
+            /* exists but expired */
+
+            dd("go to replace");
+            goto replace;
+        }
+
+        /* rc == NGX_DECLINED */
+
+        dd("go to insert");
+        goto insert;
+    }
+
+    if (rc == NGX_OK || rc == NGX_DONE) {
+
+        if (value_type == LUA_TNIL) {
+            goto remove;
+        }
+
+replace:
+
+        if (value.data && value.len == (size_t) sd->value_len) {
+
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
+                           "lua shared dict set: found old entry and value "
+                           "size matched, reusing it");
+
+            ngx_queue_remove(&sd->queue);
+            ngx_queue_insert_head(&ctx->sh->queue, &sd->queue);
+
+            sd->key_len = (u_short) key.len;
+
+            if (exptime > 0) {
+                tp = ngx_timeofday();
+                sd->expires = (uint64_t) tp->sec * 1000 + tp->msec
+                              + (uint64_t) (exptime * 1000);
+
+            } else {
+                sd->expires = 0;
+            }
+
+            sd->user_flags = user_flags;
+
+            sd->value_len = (uint32_t) value.len;
+
+            dd("setting value type to %d", value_type);
+
+            sd->value_type = (uint8_t) value_type;
+
+            p = ngx_copy(sd->data, key.data, key.len);
+            ngx_memcpy(p, value.data, value.len);
+
+            ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+            lua_pushboolean(L, 1);
+            lua_pushnil(L);
+            lua_pushboolean(L, forcible);
+            return 3;
+        }
+
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
+                       "lua shared dict set: found old entry bug value size "
+                       "NOT matched, removing it first");
+
+remove:
+
+        ngx_queue_remove(&sd->queue);
+
+        node = (ngx_rbtree_node_t *)
+                   ((u_char *) sd - offsetof(ngx_rbtree_node_t, color));
+
+        ngx_rbtree_delete(&ctx->sh->rbtree, node);
+
+        ngx_slab_free_locked(ctx->shpool, node);
+
+    }
+
+insert:
+
+    /* rc == NGX_DECLINED or value size unmatch */
+
+    if (value.data == NULL) {
+        ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+        lua_pushboolean(L, 1);
+        lua_pushnil(L);
+        lua_pushboolean(L, 0);
+        return 3;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
+                   "lua shared dict set: creating a new entry");
+
+    n = offsetof(ngx_rbtree_node_t, color)
+        + offsetof(ngx_http_lua_shdict_node_t, data)
+        + key.len
+        + value.len;
+
+    node = ngx_slab_alloc_locked(ctx->shpool, n);
+
+    if (node == NULL) {
+
+        if (flags & NGX_HTTP_LUA_SHDICT_SAFE_STORE) {
+            ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+            lua_pushboolean(L, 0);
+            lua_pushliteral(L, "no memory");
+            return 2;
+        }
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
+                       "lua shared dict set: overriding non-expired items "
+                       "due to memory shortage for entry \"%V\"", &key);
+
+        for (i = 0; i < 30; i++) {
+            if (ngx_http_lua_shdict_expire(ctx, 0) == 0) {
+                break;
+            }
+
+            forcible = 1;
+
+            node = ngx_slab_alloc_locked(ctx->shpool, n);
+            if (node != NULL) {
+                goto allocated;
+            }
+        }
+
+        ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+        lua_pushboolean(L, 0);
+        lua_pushliteral(L, "no memory");
+        lua_pushboolean(L, forcible);
+        return 3;
+    }
+
+allocated:
+
+    sd = (ngx_http_lua_shdict_node_t *) &node->color;
+
+    node->key = hash;
+    sd->key_len = (u_short) key.len;
+
+    if (exptime > 0) {
+        tp = ngx_timeofday();
+        sd->expires = (uint64_t) tp->sec * 1000 + tp->msec
+                      + (uint64_t) (exptime * 1000);
+
+    } else {
+        sd->expires = 0;
+    }
+
+    sd->user_flags = user_flags;
+
+    sd->value_len = (uint32_t) value.len;
+
+    dd("setting value type to %d", value_type);
+
+    sd->value_type = (uint8_t) value_type;
+
+    p = ngx_copy(sd->data, key.data, key.len);
+    ngx_memcpy(p, value.data, value.len);
+
+    ngx_rbtree_insert(&ctx->sh->rbtree, node);
+
+    ngx_queue_insert_head(&ctx->sh->queue, &sd->queue);
+
+    ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+    lua_pushboolean(L, 1);
+    lua_pushnil(L);
+    lua_pushboolean(L, forcible);
+    return 3;
+}
+
+```
+
 ## get
+
+ngx.shared.DICT 的另一个常用的 api 就是 get 了，他的作用是从共享内存字典中取出指定 key 所对应 value ，其功能入上文所述，是对应上一个 C 函数 ngx_http_lua_shdict_get ，代码如下：
+
+```c
+static int
+ngx_http_lua_shdict_get(lua_State *L)
+{
+  return ngx_http_lua_shdict_get_helper(L, 0 /* stale */);
+}
+
+
+static int
+ngx_http_lua_shdict_get_helper(lua_State *L, int get_stale)
+{
+    n = lua_gettop(L);
+
+    // 参数仅能是2个
+    if (n != 2) {
+        return luaL_error(L, "expecting exactly two arguments, "
+                          "but only seen %d", n);
+    }
+
+    // zone 把 ngx.shared.DICT 的唯一元素给取出来了，就是共享内存结构指针
+    zone = lua_touserdata(L, 1);
+    ctx = zone->data;
+    name = ctx->name;
+
+    // 检查参数 2 ，并赋值给 key
+    key.data = (u_char *) luaL_checklstring(L, 2, &key.len);
+
+    // 这里算了一次 hash ，但这里只是为了提高红黑树的查找速度
+    hash = ngx_crc32_short(key.data, key.len);
+
+    //  获取共享内存互斥锁
+    ngx_shmtx_lock(&ctx->shpool->mutex);
+
+    // 判断一下 过期了没
+    if (!get_stale) {
+        ngx_http_lua_shdict_expire(ctx, 1);
+    }
+
+    // 这里是查找算法
+    rc = ngx_http_lua_shdict_lookup(zone, hash, key.data, key.len, &sd);
+
+    // 找不到返回 null
+    if (rc == NGX_DECLINED || (rc == NGX_DONE && !get_stale)) {
+        ngx_shmtx_unlock(&ctx->shpool->mutex);
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // 结果赋值到 value
+    value_type = sd->value_type;
+    value.data = sd->data + sd->key_len;
+    value.len = (size_t) sd->value_len;
+
+    // 结果类型处理部分，还要做各种错误判断，这里省略一些了。
+    switch (value_type) {
+    case LUA_TSTRING:
+        lua_pushlstring(L, (char *) value.data, value.len);
+        break;
+    case LUA_TNUMBER:
+        ngx_memcpy(&num, value.data, sizeof(double));
+        lua_pushnumber(L, num);
+        break;
+    case LUA_TBOOLEAN:
+        c = *value.data;
+        lua_pushboolean(L, c ? 1 : 0);
+        break;
+    }
+
+    user_flags = sd->user_flags;
+
+    ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+    if (get_stale) {
+        if (user_flags) {
+            lua_pushinteger(L, (lua_Integer) user_flags);
+
+        } else {
+            lua_pushnil(L);
+        }
+
+        lua_pushboolean(L, rc == NGX_DONE);
+        return 3;
+    }
+
+    if (user_flags) {
+        lua_pushinteger(L, (lua_Integer) user_flags);
+        return 2;
+    }
+
+    return 1;
+}
+
+
 
 
 *  有 lua_shared_dict 这条指令的存在，预示着共享内存字典的初始化可以发生在配置文件读取阶段。
