@@ -461,17 +461,17 @@ ngx_http_lua_shdict_set_helper(lua_State *L, int flags)
             goto remove;
         }
         
-        // 这里代码被精心设计了，在这种情况下先判断是否可以直接替换主要是内存长度的判断
+        // 这里代码被精心设计了，不同的条件进入会有不同的代码路径
 replace:
-
+        // replace 的第一步，如果 value 大小不变，修改 value 即可
         if (value.data && value.len == (size_t) sd->value_len) {
 
             // 队列里把找到的元素给删除掉，并把元素从队列头插入
             ngx_queue_remove(&sd->queue);
             ngx_queue_insert_head(&ctx->sh->queue, &sd->queue);
 
+            // 设置 sd 的数据值
             sd->key_len = (u_short) key.len;
-
             if (exptime > 0) {
                 tp = ngx_timeofday();
                 sd->expires = (uint64_t) tp->sec * 1000 + tp->msec
@@ -482,16 +482,13 @@ replace:
             }
 
             sd->user_flags = user_flags;
-
             sd->value_len = (uint32_t) value.len;
-
-            dd("setting value type to %d", value_type);
-
             sd->value_type = (uint8_t) value_type;
 
             p = ngx_copy(sd->data, key.data, key.len);
             ngx_memcpy(p, value.data, value.len);
 
+            // 解锁
             ngx_shmtx_unlock(&ctx->shpool->mutex);
 
             lua_pushboolean(L, 1);
@@ -501,7 +498,7 @@ replace:
         }
 
 remove:
-        // 队列里把找到的元素给删除掉
+        // 第二步，队列里把找到的元素给删除掉
         ngx_queue_remove(&sd->queue);
 
         node = (ngx_rbtree_node_t *)
@@ -517,7 +514,7 @@ remove:
 
 insert:
 
-    // 
+    // 第三步，判断为空，即判断操作为删除，直接返回并退出即可
     if (value.data == NULL) {
         ngx_shmtx_unlock(&ctx->shpool->mutex);
 
@@ -527,19 +524,18 @@ insert:
         return 3;
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
-                   "lua shared dict set: creating a new entry");
-
+    // 计算新增节点所需空间大小，并按空间大小给节点分配内存
     n = offsetof(ngx_rbtree_node_t, color)
         + offsetof(ngx_http_lua_shdict_node_t, data)
         + key.len
         + value.len;
-
     node = ngx_slab_alloc_locked(ctx->shpool, n);
 
+    // 分配失败，空间不足
     if (node == NULL) {
-
+        
         if (flags & NGX_HTTP_LUA_SHDICT_SAFE_STORE) {
+            // 如果是 safe 系列 api，需要保护已有数据，返回内存不足
             ngx_shmtx_unlock(&ctx->shpool->mutex);
 
             lua_pushboolean(L, 0);
@@ -547,11 +543,9 @@ insert:
             return 2;
         }
 
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
-                       "lua shared dict set: overriding non-expired items "
-                       "due to memory shortage for entry \"%V\"", &key);
-
+        // 尝试 30 次对字典中的过期元素进行内存回收
         for (i = 0; i < 30; i++) {
+
             if (ngx_http_lua_shdict_expire(ctx, 0) == 0) {
                 break;
             }
@@ -564,6 +558,7 @@ insert:
             }
         }
 
+        // 尝试失败，还是没内存，认命了返回内存不足
         ngx_shmtx_unlock(&ctx->shpool->mutex);
 
         lua_pushboolean(L, 0);
@@ -573,36 +568,35 @@ insert:
     }
 
 allocated:
-
+    // 第四步，分配好内存之后，获取 sd
     sd = (ngx_http_lua_shdict_node_t *) &node->color;
-
+    
     node->key = hash;
+    
+    // 设置 sd 的数据值
     sd->key_len = (u_short) key.len;
-
     if (exptime > 0) {
         tp = ngx_timeofday();
         sd->expires = (uint64_t) tp->sec * 1000 + tp->msec
                       + (uint64_t) (exptime * 1000);
-
     } else {
         sd->expires = 0;
     }
 
     sd->user_flags = user_flags;
-
     sd->value_len = (uint32_t) value.len;
-
-    dd("setting value type to %d", value_type);
-
     sd->value_type = (uint8_t) value_type;
 
     p = ngx_copy(sd->data, key.data, key.len);
     ngx_memcpy(p, value.data, value.len);
 
+    // 把节点插入红黑树中
     ngx_rbtree_insert(&ctx->sh->rbtree, node);
-
+    
+    // 把节点插入队列中
     ngx_queue_insert_head(&ctx->sh->queue, &sd->queue);
 
+    // 解锁并返回成功
     ngx_shmtx_unlock(&ctx->shpool->mutex);
 
     lua_pushboolean(L, 1);
@@ -612,10 +606,41 @@ allocated:
 }
 
 ```
+代码注释可能并没有很好的表达里边的逻辑，特别是加了若干 goto 跳转之后更是理解起来比较费劲。
+这里我们分别对 add ， replace ， set 三个 api 做一下关键逻辑梳理，我们先看看 set 系列 api：
+
+*  传入参数的数量和类型检查
+*  调用 ngx_http_lua_shdict_lookup 查找节点
+*  找到节点，比较 value 大小是否一样，如果一样直接替换value，返回成功
+*  如果找不到节点或者 value 大小不一致，删除节点
+*  重新分配节点，如果分配失败，返回失败
+*  对节点进行插入，返回插入结果
+
+set 函数是关键路径走得最完整的，我们再看看 add ：
+
+*  传入参数的数量和类型检查
+*  调用 ngx_http_lua_shdict_lookup 查找节点
+*  找到节点，返回失败
+*  如果节点过期，比较 value 大小是否一样，如果一样直接替换value，返回成功
+*  如果找不到节点或者节点过期并且大小不一致，删除节点
+*  重新分配节点，如果分配失败，返回失败
+*  对节点进行插入，返回插入结果
+
+从上述可见与 set 相比， add 的执行路径是不一样的特别在于找到节点后的处理方面，我们再看看 replace ：
+
+*  传入参数的数量和类型检查
+*  调用 ngx_http_lua_shdict_lookup 查找节点
+*  如果找不到节点或节点过期，返回失败
+*  如果找到节点，比较 value 大小是否一样，如果一样直接替换value，返回成功
+*  如果大小不一致，删除节点
+*  重新分配节点，如果分配失败，返回失败
+*  对节点进行插入，返回插入结果
+
+可以看出 replace 与 add 的找到节点之后的处理方法刚好相反，这可以说就是他们要实现的功能的区别所在。
 
 ## get
 
-ngx.shared.DICT 的另一个常用的 api 就是 get 了，他的作用是从共享内存字典中取出指定 key 所对应 value ，其功能入上文所述，是对应上一个 C 函数 ngx_http_lua_shdict_get ，代码如下：
+ngx.shared.DICT 的另一个常用的 api 就是 get 和 get_stale api 了，他的作用是从共享内存字典中取出指定 key 所对应 value ，其功能入上文所述，是对应上一个 C 函数 ngx_http_lua_shdict_get ，代码如下：
 
 ```c
 static int
@@ -624,6 +649,11 @@ ngx_http_lua_shdict_get(lua_State *L)
   return ngx_http_lua_shdict_get_helper(L, 0 /* stale */);
 }
 
+static int
+ngx_http_lua_shdict_get_stale(lua_State *L)
+{
+  return ngx_http_lua_shdict_get_helper(L, 1 /* stale */);
+}
 
 static int
 ngx_http_lua_shdict_get_helper(lua_State *L, int get_stale)
@@ -687,6 +717,7 @@ ngx_http_lua_shdict_get_helper(lua_State *L, int get_stale)
 
     user_flags = sd->user_flags;
 
+    // 解锁， 返回查找结果
     ngx_shmtx_unlock(&ctx->shpool->mutex);
 
     if (get_stale) {
@@ -709,7 +740,14 @@ ngx_http_lua_shdict_get_helper(lua_State *L, int get_stale)
     return 1;
 }
 
+```
 
+## 总结
+从 set 和 get 系列的代码分析可以看出：
+*  由于使用了共享内存，所以内存分配用了 slab 内存分配机制。
+*  由于要实现字典功能，所以内存的组织结构使用了红黑树作为底层实现。
+*  但除了红黑树，节点其实还需要插入到一个队列中，这是未解之谜 1 。
+*  除了使用了红黑树作为基础，为了实现有效期功能，添加了 ngx_http_lua_shdict_expire 以及 ngx_http_lua_shdict_lookup 等函数。
 
 
 *  有 lua_shared_dict 这条指令的存在，预示着共享内存字典的初始化可以发生在配置文件读取阶段。
