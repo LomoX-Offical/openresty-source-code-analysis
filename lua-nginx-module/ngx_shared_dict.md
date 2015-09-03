@@ -302,7 +302,7 @@ ngx_http_lua_inject_shdict_api(ngx_http_lua_main_conf_t *lmcf, lua_State *L)
 然后后面对会围绕着这个共享内存数据结构地址 zone[i] 展开进行操作。
 
 # set
-ngx.shared.DICT 的其中一个常用的 api 就是 set 了，但除了set api ，其实还包括 add ， safe_add ， replace ， add ， add ， 
+ngx.shared.DICT 的其中一个常用的 api 就是 set 了，但除了set ，其实还包括 add ， safe_add ， replace ， safe_set 都在 set api 集合里边。
 
 ```c
 
@@ -312,7 +312,6 @@ ngx_http_lua_shdict_add(lua_State *L)
     return ngx_http_lua_shdict_set_helper(L, NGX_HTTP_LUA_SHDICT_ADD);
 }
 
-
 static int
 ngx_http_lua_shdict_safe_add(lua_State *L)
 {
@@ -320,13 +319,11 @@ ngx_http_lua_shdict_safe_add(lua_State *L)
                                           |NGX_HTTP_LUA_SHDICT_SAFE_STORE);
 }
 
-
 static int
 ngx_http_lua_shdict_replace(lua_State *L)
 {
     return ngx_http_lua_shdict_set_helper(L, NGX_HTTP_LUA_SHDICT_REPLACE);
 }
-
 
 static int
 ngx_http_lua_shdict_set(lua_State *L)
@@ -334,108 +331,69 @@ ngx_http_lua_shdict_set(lua_State *L)
     return ngx_http_lua_shdict_set_helper(L, 0);
 }
 
-
 static int
 ngx_http_lua_shdict_safe_set(lua_State *L)
 {
     return ngx_http_lua_shdict_set_helper(L, NGX_HTTP_LUA_SHDICT_SAFE_STORE);
 }
 
+```
 
+这里可以看出，这些 api 的 C 函数的实现都调用到 ngx_http_lua_shdict_set_helper 函数，但第二个参数却各不一样。
+
+```c
 static int
 ngx_http_lua_shdict_set_helper(lua_State *L, int flags)
 {
-    int                          i, n;
-    ngx_str_t                    key;
-    uint32_t                     hash;
-    ngx_int_t                    rc;
-    ngx_http_lua_shdict_ctx_t   *ctx;
-    ngx_http_lua_shdict_node_t  *sd;
-    ngx_str_t                    value;
-    int                          value_type;
-    double                       num;
-    u_char                       c;
-    lua_Number                   exptime = 0;
-    u_char                      *p;
-    ngx_rbtree_node_t           *node;
-    ngx_time_t                  *tp;
-    ngx_shm_zone_t              *zone;
-    int                          forcible = 0;
-                         /* indicates whether to foricibly override other
-                          * valid entries */
-    int32_t                      user_flags = 0;
-
+    // 获取栈内有多少数据，判断数量是否有错
     n = lua_gettop(L);
-
     if (n != 3 && n != 4 && n != 5) {
         return luaL_error(L, "expecting 3, 4 or 5 arguments, "
                           "but only seen %d", n);
     }
-
+    
+    // 取得 Lua 虚拟机的栈底数据，在这个环境下他不是第一个传入参数，而是 ngx.shared.DICT 本身，它的 value 其实就是共享内存结构体指针 
     zone = lua_touserdata(L, 1);
-    if (zone == NULL) {
-        return luaL_error(L, "bad \"zone\" argument");
-    }
 
     ctx = zone->data;
 
-    if (lua_isnil(L, 2)) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "nil key");
-        return 2;
-    }
-
+    // 从 Lua 虚拟机的第 1 个传入参数获取 key
     key.data = (u_char *) luaL_checklstring(L, 2, &key.len);
-
-    if (key.len == 0) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "empty key");
-        return 2;
-    }
-
-    if (key.len > 65535) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "key too long");
-        return 2;
-    }
-
+    // 计算个 hash
     hash = ngx_crc32_short(key.data, key.len);
-
+    
+    
+    // 获取第 2 个传入参数的类型，根据类型做类型获取
     value_type = lua_type(L, 3);
-
     switch (value_type) {
     case LUA_TSTRING:
         value.data = (u_char *) lua_tolstring(L, 3, &value.len);
         break;
-
     case LUA_TNUMBER:
         value.len = sizeof(double);
         num = lua_tonumber(L, 3);
         value.data = (u_char *) &num;
         break;
-
     case LUA_TBOOLEAN:
         value.len = sizeof(u_char);
         c = lua_toboolean(L, 3) ? 1 : 0;
         value.data = &c;
         break;
-
     case LUA_TNIL:
         if (flags & (NGX_HTTP_LUA_SHDICT_ADD|NGX_HTTP_LUA_SHDICT_REPLACE)) {
             lua_pushnil(L);
             lua_pushliteral(L, "attempt to add or replace nil values");
             return 2;
         }
-
         ngx_str_null(&value);
         break;
-
     default:
         lua_pushnil(L);
         lua_pushliteral(L, "bad value type");
         return 2;
     }
 
+    // 如果有第 4 个参数，取出来作为 exptime 过期时间参数
     if (n >= 4) {
         exptime = luaL_checknumber(L, 4);
         if (exptime < 0) {
@@ -443,22 +401,24 @@ ngx_http_lua_shdict_set_helper(lua_State *L, int flags)
         }
     }
 
+    // 如果有第 5 个参数，取出来作为 user_flags 参数
     if (n == 5) {
         user_flags = (uint32_t) luaL_checkinteger(L, 5);
     }
 
+    // 到了操作步骤了，先对这块共享内存加锁
     ngx_shmtx_lock(&ctx->shpool->mutex);
 
-#if 1
+    // 这个函数的功能是找到 1 个已经过期的元素做删除操作
     ngx_http_lua_shdict_expire(ctx, 1);
-#endif
 
+    // 在共享内存的数据结构内查找 key 为索引的存储空间
     rc = ngx_http_lua_shdict_lookup(zone, hash, key.data, key.len, &sd);
-
-    dd("shdict lookup returned %d", (int) rc);
-
+    
+    // replace api 情况下
     if (flags & NGX_HTTP_LUA_SHDICT_REPLACE) {
-
+        
+        // 没找到或者过期了，解锁，返回值传失败，没找到
         if (rc == NGX_DECLINED || rc == NGX_DONE) {
             ngx_shmtx_unlock(&ctx->shpool->mutex);
 
@@ -468,13 +428,13 @@ ngx_http_lua_shdict_set_helper(lua_State *L, int flags)
             return 3;
         }
 
-        /* rc == NGX_OK */
-
+        // 找到了，对这个空间做 value 替换
         goto replace;
     }
 
+    // add 和 safe_add api 情况下
     if (flags & NGX_HTTP_LUA_SHDICT_ADD) {
-
+        // 找到了，解锁，返回值传失败，已存在
         if (rc == NGX_OK) {
             ngx_shmtx_unlock(&ctx->shpool->mutex);
 
@@ -484,33 +444,29 @@ ngx_http_lua_shdict_set_helper(lua_State *L, int flags)
             return 3;
         }
 
+        // 过期了，做替换
         if (rc == NGX_DONE) {
-            /* exists but expired */
-
-            dd("go to replace");
             goto replace;
         }
 
-        /* rc == NGX_DECLINED */
-
-        dd("go to insert");
+        // 没找到，做插入
         goto insert;
     }
 
+    // set 和 safe_set api 的情况下
     if (rc == NGX_OK || rc == NGX_DONE) {
-
+        
+        // value 类型是 null 情况下，做删除
         if (value_type == LUA_TNIL) {
             goto remove;
         }
-
+        
+        // 这里代码被精心设计了，在这种情况下先判断是否可以直接替换主要是内存长度的判断
 replace:
 
         if (value.data && value.len == (size_t) sd->value_len) {
 
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
-                           "lua shared dict set: found old entry and value "
-                           "size matched, reusing it");
-
+            // 队列里把找到的元素给删除掉，并把元素从队列头插入
             ngx_queue_remove(&sd->queue);
             ngx_queue_insert_head(&ctx->sh->queue, &sd->queue);
 
@@ -544,27 +500,24 @@ replace:
             return 3;
         }
 
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->log, 0,
-                       "lua shared dict set: found old entry bug value size "
-                       "NOT matched, removing it first");
-
 remove:
-
+        // 队列里把找到的元素给删除掉
         ngx_queue_remove(&sd->queue);
 
         node = (ngx_rbtree_node_t *)
                    ((u_char *) sd - offsetof(ngx_rbtree_node_t, color));
 
+        // 红黑树上也把元素给删除掉
         ngx_rbtree_delete(&ctx->sh->rbtree, node);
 
+        // 最后还把元素占用的内存释放掉
         ngx_slab_free_locked(ctx->shpool, node);
 
     }
 
 insert:
 
-    /* rc == NGX_DECLINED or value size unmatch */
-
+    // 
     if (value.data == NULL) {
         ngx_shmtx_unlock(&ctx->shpool->mutex);
 
