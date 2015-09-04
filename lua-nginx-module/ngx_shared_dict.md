@@ -747,8 +747,132 @@ ngx_http_lua_shdict_get_helper(lua_State *L, int get_stale)
 *  由于使用了共享内存，所以内存分配用了 slab 内存分配机制。
 *  由于要实现字典功能，所以内存的组织结构使用了红黑树作为底层实现。
 *  但除了红黑树，节点其实还需要插入到一个队列中，这是未解之谜 1 。
-*  除了使用了红黑树作为基础，为了实现有效期功能，添加了 ngx_http_lua_shdict_expire 以及 ngx_http_lua_shdict_lookup 等函数。
+*  除了使用了红黑树作为基础，为了实现有效期功能，添加了有效期相关的 ngx_http_lua_shdict_expire 以及 ngx_http_lua_shdict_lookup 等函数。
 
+我们看看 ngx_http_lua_shdict_expire 这个函数，他的主要功能就是把 n 个已经过期的内存释放掉，降低内存使用：
+
+```c
+static int
+ngx_http_lua_shdict_expire(ngx_http_lua_shdict_ctx_t *ctx, ngx_uint_t n)
+{
+    // 获取当前时间
+    tp = ngx_timeofday();
+    now = (uint64_t) tp->sec * 1000 + tp->msec;
+
+    /*
+     * n == 1 删除一个或者两个过期元素
+     * n == 0 强制删除一个最老的元素，
+     *        然后删除一个或者两个过期元素
+     */
+
+    while (n < 3) {
+        
+        // 队列中无元素，不做任何事情退出
+        if (ngx_queue_empty(&ctx->sh->queue)) {
+            return freed;
+        }
+
+        // 取下一个队列中的字典元素 sd
+        q = ngx_queue_last(&ctx->sh->queue);
+        sd = ngx_queue_data(q, ngx_http_lua_shdict_node_t, queue);
+
+        // 如果 n = 0 则忽略有效期逻辑，直接进入删除步骤，实现强制删除逻辑
+        if (n++ != 0) {
+            
+            // 如果 sd 没有设置有效期，直接退出
+            if (sd->expires == 0) {
+                return freed;
+            }
+
+            // 如果有效期没过，直接退出
+            ms = sd->expires - now;
+            if (ms > 0) {
+                return freed;
+            }
+        }
+
+        // 的确过期了，队列中删除此元素，红黑树也删除此元素，并且占用的内存空间归还给 slab
+        ngx_queue_remove(q);
+        node = (ngx_rbtree_node_t *)
+                   ((u_char *) sd - offsetof(ngx_rbtree_node_t, color));
+        ngx_rbtree_delete(&ctx->sh->rbtree, node);
+
+        ngx_slab_free_locked(ctx->shpool, node);
+
+        freed++;
+    }
+
+    return freed;
+}
+```
+
+聪明的读者能理解队列的结尾为什么是有效时间最老的元素呢？
+
+好吧，聪明的你应该不用我多解释，那么下面我们看看 ngx_http_lua_shdict_lookup 函数吧：
+
+```c
+
+static ngx_int_t
+ngx_http_lua_shdict_lookup(ngx_shm_zone_t *shm_zone, ngx_uint_t hash,
+    u_char *kdata, size_t klen, ngx_http_lua_shdict_node_t **sdp)
+{
+    // 取共享内存字典的上下文，红黑树根节点，
+    ctx = shm_zone->data;
+    node = ctx->sh->rbtree.root;
+    sentinel = ctx->sh->rbtree.sentinel;
+
+    while (node != sentinel) {
+
+        if (hash < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (hash > node->key) {
+            node = node->right;
+            continue;
+        }
+
+        /* hash == node->key */
+
+        sd = (ngx_http_lua_shdict_node_t *) &node->color;
+
+        rc = ngx_memn2cmp(kdata, sd->data, klen, (size_t) sd->key_len);
+
+        if (rc == 0) {
+            ngx_queue_remove(&sd->queue);
+            ngx_queue_insert_head(&ctx->sh->queue, &sd->queue);
+
+            *sdp = sd;
+
+            dd("node expires: %lld", (long long) sd->expires);
+
+            if (sd->expires != 0) {
+                tp = ngx_timeofday();
+
+                now = (uint64_t) tp->sec * 1000 + tp->msec;
+                ms = sd->expires - now;
+
+                dd("time to live: %lld", (long long) ms);
+
+                if (ms < 0) {
+                    dd("node already expired");
+                    return NGX_DONE;
+                }
+            }
+
+            return NGX_OK;
+        }
+
+        node = (rc < 0) ? node->left : node->right;
+    }
+
+    *sdp = NULL;
+
+    return NGX_DECLINED;
+}
+
+```
 
 *  有 lua_shared_dict 这条指令的存在，预示着共享内存字典的初始化可以发生在配置文件读取阶段。
 *  应该不存在 
