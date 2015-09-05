@@ -742,12 +742,7 @@ ngx_http_lua_shdict_get_helper(lua_State *L, int get_stale)
 
 ```
 
-## 总结
-从 set 和 get 系列的代码分析可以看出：
-*  由于使用了共享内存，所以内存分配用了 slab 内存分配机制。
-*  由于要实现字典功能，所以内存的组织结构使用了红黑树作为底层实现。
-*  但除了红黑树，节点其实还需要插入到一个队列中，这是未解之谜 1 。
-*  除了使用了红黑树作为基础，为了实现有效期功能，添加了有效期相关的 ngx_http_lua_shdict_expire 以及 ngx_http_lua_shdict_lookup 等函数。
+## 红黑树操作相关函数
 
 我们看看 ngx_http_lua_shdict_expire 这个函数，他的主要功能就是把 n 个已经过期的内存释放掉，降低内存使用：
 
@@ -806,7 +801,11 @@ ngx_http_lua_shdict_expire(ngx_http_lua_shdict_ctx_t *ctx, ngx_uint_t n)
 }
 ```
 
-聪明的读者能理解队列的结尾为什么是有效时间最老的元素呢？
+
+
+这个函数的实现很大程度上参考了 ngx_http_limit_req_module 模块中的 ngx_http_limit_req_expire 函数实现，流程基本一样，除了有效期各自模块有各自的定义，所以它们的实现也有所区别，其具体区别就是共享内存字典需要对 expires 为 0 的情况，也就是没设置有效期的情况做跳过流程的处理。
+
+在这里，聪明的读者能理解队列的结尾为什么是有效时间最老的元素呢？
 
 好吧，聪明的你应该不用我多解释，那么下面我们看看 ngx_http_lua_shdict_lookup 函数吧：
 
@@ -816,13 +815,14 @@ static ngx_int_t
 ngx_http_lua_shdict_lookup(ngx_shm_zone_t *shm_zone, ngx_uint_t hash,
     u_char *kdata, size_t klen, ngx_http_lua_shdict_node_t **sdp)
 {
-    // 取共享内存字典的上下文，红黑树根节点，
+    // 取共享内存字典的上下文，红黑树根节点和哨兵节点
     ctx = shm_zone->data;
     node = ctx->sh->rbtree.root;
     sentinel = ctx->sh->rbtree.sentinel;
 
     while (node != sentinel) {
-
+        
+        // 按 hash 比较大小找到相等节点
         if (hash < node->key) {
             node = node->left;
             continue;
@@ -833,30 +833,26 @@ ngx_http_lua_shdict_lookup(ngx_shm_zone_t *shm_zone, ngx_uint_t hash,
             continue;
         }
 
-        /* hash == node->key */
-
+        // 相等的找到了，结构体小技巧，把 sd 从 node 中取出来
         sd = (ngx_http_lua_shdict_node_t *) &node->color;
 
+        // hash 相等不代表 key 一样啊，这时候还得判断一下 key 是否相等
         rc = ngx_memn2cmp(kdata, sd->data, klen, (size_t) sd->key_len);
 
         if (rc == 0) {
+            // key 也一样的情况下，从队列中取出，再重新插入到队列头中，这个是重新计算有效期的意思
             ngx_queue_remove(&sd->queue);
             ngx_queue_insert_head(&ctx->sh->queue, &sd->queue);
 
+            // 设置可以返回的 sdp
             *sdp = sd;
 
-            dd("node expires: %lld", (long long) sd->expires);
-
+            // 计算有效期，并返回相应结果
             if (sd->expires != 0) {
                 tp = ngx_timeofday();
-
                 now = (uint64_t) tp->sec * 1000 + tp->msec;
                 ms = sd->expires - now;
-
-                dd("time to live: %lld", (long long) ms);
-
                 if (ms < 0) {
-                    dd("node already expired");
                     return NGX_DONE;
                 }
             }
@@ -864,15 +860,88 @@ ngx_http_lua_shdict_lookup(ngx_shm_zone_t *shm_zone, ngx_uint_t hash,
             return NGX_OK;
         }
 
+        // key 比较结果不相等的情况下，根据结果往左右节点继续找
         node = (rc < 0) ? node->left : node->right;
     }
 
+    // 哨兵节点，直接返回 null ，找不到
     *sdp = NULL;
-
     return NGX_DECLINED;
 }
 
 ```
+这个函数要实现的功能就是查找到 key 所在节点，其实现与 ngx_http_limit_req_module 模块中的 ngx_http_limit_req_lookup 有点相似。
 
-*  有 lua_shared_dict 这条指令的存在，预示着共享内存字典的初始化可以发生在配置文件读取阶段。
-*  应该不存在 
+
+在 nginx 代码中，ngx_rbtree.c 只实现了 rbtree 的插入删除等操作，并没有实现查找操作，都是各个使用 rbtree 的模块自己实现的，其典型实现是在 ngx_http_limit_req_module 中，它其中的函数 ngx_http_limit_conn_lookup 实现了查找操作，但也有其模块本身的一些特殊逻辑在其中，而 ngx_http_lua_shdict_lookup 的基本逻辑是与 ngx_http_limit_conn_lookup 类似的，又有共享内存字典特有的有效期逻辑在其中：
+
+
+然后，在插入流程中， ngx_rbtree_t 的插入函数可以做部分定制，这是通过实现 insert 回调函数指针实现的，在 ngx_rbtree_insert 插入操作函数流程中会多次使用自定义 insert 回调函数，已完成插入操作，并实现高度灵活定制。但其实nginx 还是实现了 insert 回调函数的默认定义 ngx_rbtree_insert_value ，各个 nginx 模块除了可以使用默认 insert 回调函数之外，也可以自己实现定制的 insert 回调。
+
+在共享内存字典的实现中，没有使用默认插入函数 ngx_rbtree_insert_value ，而是自己实现了 ngx_http_lua_shdict_rbtree_insert_value ，我们先回头看看 ngx_http_lua_shdict_init_zone 函数对其使用的 rbtree 的定义：
+
+```c
+#define ngx_rbtree_init(tree, s, i)                                           \
+    ngx_rbtree_sentinel_init(s);                                              \
+    (tree)->root = s;                                                         \
+    (tree)->sentinel = s;                                                     \
+    (tree)->insert = i
+
+
+    ngx_rbtree_init(&ctx->sh->rbtree, &ctx->sh->sentinel,
+                    ngx_http_lua_shdict_rbtree_insert_value);
+
+```
+
+在这个代码片段中，我们可以看出 rbtree 的 insert 回调函数指针被定义为 ngx_http_lua_shdict_rbtree_insert_value ， 这意味着插入操作里边会使用 ngx_http_lua_shdict_rbtree_insert_value 做插入操作基础，在插入完毕之后红黑树会做标准的平衡操作。
+
+```c
+void
+ngx_http_lua_shdict_rbtree_insert_value(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+{
+    // 在 temp 节点上插入 node ， sentinel 是哨兵节点
+    for ( ;; ) {
+        // 通过对 hash 的比较，决定往左右查找
+        if (node->key < temp->key) {
+            p = &temp->left;
+        } else if (node->key > temp->key) {
+            p = &temp->right;
+        } else { 
+            // 比较 hash 发现 hash 已经存在节点，按 key 比较结果再决定左右节点查找
+            sdn = (ngx_http_lua_shdict_node_t *) &node->color;
+            sdnt = (ngx_http_lua_shdict_node_t *) &temp->color;
+
+            p = ngx_memn2cmp(sdn->data, sdnt->data, sdn->key_len,
+                             sdnt->key_len) < 0 ? &temp->left : &temp->right;
+        }
+
+        // 直到找到的节点等于哨兵节点，也就是这个节点不存在退出查找循环。
+        if (*p == sentinel) {
+            break;
+        }
+
+        temp = *p;
+    }
+
+    // 把节点插入到 temp 节点中，并初始化其父节点左右节点
+    *p = node;
+    node->parent = temp;
+    node->left = sentinel;
+    node->right = sentinel;
+    ngx_rbt_red(node);
+}
+```
+与 ngx_rbtree_insert_value 比较，差别在于对 hash 相等情况下的处理，在 ngx_rbtree_insert_value 函数中相等情况下会统一向右节点查找，而 ngx_http_lua_shdict_rbtree_insert_value 函数中，hash 相等情况下会用 key 原来数据做比较并根据其结果决定向左右查找，而这个实现其实与 ngx_http_limit_req_rbtree_insert_value 函数实现基本一致。
+
+
+
+## 总结
+从 set 和 get 系列的代码分析可以看出：
+*  由于使用了共享内存，所以内存分配用了 slab 内存分配机制。
+*  由于要实现字典功能，所以内存的组织结构使用了红黑树作为底层实现。
+*  但除了红黑树，节点其实还需要插入到一个队列中，这是未解之谜 1 。
+*  红黑树使用的 key 是一个整数，在共享内存字典的索引字符串先被 CRC 算法计算一次得到 hash 然后作为红黑树的索引 key 使用，这个使用导致其实 红黑树对原本的索引字符串而言并没有排序功能，不能实现条件范围搜索的功能。
+*  除了使用了红黑树作为基础，为了实现有效期功能，添加了有效期相关的 ngx_http_lua_shdict_expire 、 ngx_http_lua_shdict_rbtree_insert_value 以及 ngx_http_lua_shdict_lookup 等函数。
+
+从实现上不难看出，共享内存字典的实现很大程度上参考了 ngx_http_limit_req_module 对红黑树使用的代码实现，事实上这两处功能其实基本相同，作者参考成熟度较高的 ngx_http_limit_req_module 模块代码也为其本身成熟度奠定了良好的基础。
