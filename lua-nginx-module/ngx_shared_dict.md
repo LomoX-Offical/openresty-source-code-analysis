@@ -301,6 +301,122 @@ ngx_http_lua_inject_shdict_api(ngx_http_lua_main_conf_t *lmcf, lua_State *L)
 这里的 api 实现并不是直接放在 ngx.shared 上，而是把 shared 作为一个 table ，里边有各种带名字的共享内存字典对象，这些对象存储了一个共享内存数据结构地址，并且继承了 __index 可以索引到 13 个函数 api 。
 然后后面对会围绕着这个共享内存数据结构地址 zone[i] 展开进行操作。
 
+# struct
+
+在代码分析重要的一环就是分析数据结构，在 shared dict 共享内存字典的实现中，上下文结构体 ngx_http_lua_shdict_ctx_t 用于维护共享内存以及字典结构，代码如下：
+
+
+```c
+typedef struct {
+    ngx_http_lua_shdict_shctx_t  *sh;
+    ngx_slab_pool_t              *shpool;
+    ngx_str_t                     name;
+    ngx_http_lua_main_conf_t     *main_conf;
+    ngx_log_t                    *log;
+} ngx_http_lua_shdict_ctx_t;
+
+```
+
+在这里的结构成员变量，都在 ngx_http_lua_shdict_init_zone 函数中初始化：
+
+*  ngx_http_lua_shdict_shctx_t *sh 结构是用于维护字典实现数据的结构
+*  ngx_slab_pool_t *shpool 是 nginx 提供的 slab 内存分配机制实现的内存池，这里实际操作的是一块共享内存，提供在共享内存中分配内存的功能
+*  ngx_str_t name 是字符串类型，用于保存本共享内存字典的名字，作为唯一识别码存在
+*  ngx_http_lua_main_conf_t  *main_conf 这里保存了 main 配置的指针，目前只用于判断是否需要延后调用 lmcf->init_handler
+*  ngx_log_t *log 写日志数据指针
+
+咱们看看 ngx_http_lua_shdict_shctx_t 结构：
+
+```c
+typedef struct {
+    ngx_rbtree_t                  rbtree;
+    ngx_rbtree_node_t             sentinel;
+    ngx_queue_t                   queue;
+} ngx_http_lua_shdict_shctx_t;
+
+```
+
+ngx_http_lua_shdict_shctx_t 包含：
+
+*  ngx_rbtree_t  rbtree 一个红黑树结构
+*  ngx_rbtree_node_t  sentinel 一个红黑树哨兵节点
+*  ngx_queue_t  queue 还有一个队列结构
+
+在这里，包括 ngx_http_lua_shdict_shctx_t 都是从 shpool 分配出来的，里边的红黑树节点，哨兵节点，队列节点都是也都是从 shpool 分配出来。
+
+这里有共享内存字典节点结构的声明：
+
+```c
+
+typedef struct {
+    u_char                       color;
+    u_char                       dummy;
+    u_short                      key_len;
+    ngx_queue_t                  queue;
+    uint64_t                     expires;
+    uint8_t                      value_type;
+    uint32_t                     value_len;
+    uint32_t                     user_flags;
+    u_char                       data[1];
+} ngx_http_lua_shdict_node_t;
+
+typedef struct ngx_rbtree_node_s  ngx_rbtree_node_t;
+
+struct ngx_rbtree_node_s {
+    ngx_rbtree_key_t       key;
+    ngx_rbtree_node_t     *left;
+    ngx_rbtree_node_t     *right;
+    ngx_rbtree_node_t     *parent;
+    u_char                 color;
+    u_char                 data;
+};
+
+typedef struct ngx_queue_s  ngx_queue_t;
+
+struct ngx_queue_s {
+    ngx_queue_t  *prev;
+    ngx_queue_t  *next;
+};
+
+
+```
+
+在 nginx 的红黑树使用手法上，这个结构作为用户数据结构而存在，共享内存字典在红黑树结构使用手法基本参考了 ngx_http_limit_req_module 模块的手法，我们来看看下面若干代码片段：
+
+```c
+    ngx_rbtree_node_t           *node;
+    ngx_http_lua_shdict_node_t  *sd;
+    ngx_queue_t                 *q;
+
+    // 1、为节点内存申请，摘自 ngx_http_lua_shdict_set_helper
+    n = offsetof(ngx_rbtree_node_t, color)
+        + offsetof(ngx_http_lua_shdict_node_t, data)
+        + key.len
+        + value.len;
+    node = ngx_slab_alloc_locked(ctx->shpool, n);
+
+    // 2、从红黑树节点获取 ngx_http_lua_shdict_node_t 节点，摘自 ngx_http_lua_shdict_set_helper
+    sd = (ngx_http_lua_shdict_node_t *) &node->color;
+
+    // 3、从 ngx_http_lua_shdict_node_t 节点获取红黑树节点，摘自 ngx_http_lua_shdict_expire
+    node = (ngx_rbtree_node_t *)
+                ((u_char *) sd - offsetof(ngx_rbtree_node_t, color));
+
+
+    // 4、从队列节点获取 ngx_http_lua_shdict_node_t 节点，摘自 ngx_http_lua_shdict_expire
+    sd = ngx_queue_data(q, ngx_http_lua_shdict_node_t, queue);
+
+
+```
+
+从上面代码片段可以看出这些结构的包含关系：
+
+*  ngx_rbtree_node_t 结构体实际上包含了 ngx_http_lua_shdict_node_t ，所以分配内存的阶段会多分配 ngx_http_lua_shdict_node_t 的大小，当然没有那么简单，还要去除双方的共同占用的成员变量，有 color 和 data 两个。
+*  ngx_http_lua_shdict_node_t 实际上也包含 ngx_queue_t ，这在 ngx_http_lua_shdict_node_t 上就直接有体现了
+*  他们之间的结构转换，是直接做地址偏移加减完成的。
+
+
+
 # set
 ngx.shared.DICT 的其中一个常用的 api 就是 set 了，但除了set ，其实还包括 add ， safe_add ， replace ， safe_set 都在 set api 集合里边。
 
@@ -934,14 +1050,102 @@ ngx_http_lua_shdict_rbtree_insert_value(ngx_rbtree_node_t *temp,
 ```
 与 ngx_rbtree_insert_value 比较，差别在于对 hash 相等情况下的处理，在 ngx_rbtree_insert_value 函数中相等情况下会统一向右节点查找，而 ngx_http_lua_shdict_rbtree_insert_value 函数中，hash 相等情况下会用 key 原来数据做比较并根据其结果决定向左右查找，而这个实现其实与 ngx_http_limit_req_rbtree_insert_value 函数实现基本一致。
 
+## get_keys
+
+这里还实现了一个获取所有 key 的 api ，不过需要注意的是这个 api 的性能消耗，作者在函数开头的注释中写道，这个 api 用时间换空间，有可能比较慢，最坏情况 O(2n)
+
+```c
+
+/*
+ * This trades CPU for memory. This is potentially slow. O(2n)
+ */
+
+static int
+ngx_http_lua_shdict_get_keys(lua_State *L)
+{
+    // 照例，判断函数参数数量
+    n = lua_gettop(L);
+
+    // this 应该是一个轻量用户数据
+    luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);
+
+    // 把 zone 从 this 取出
+    zone = lua_touserdata(L, 1);
+
+    // 第一个参数， max_count 默认 1024
+    if (n == 2) {
+        attempts = luaL_checkint(L, 2);
+    }
+
+    // 对共享内存加锁
+    ctx = zone->data;
+    ngx_shmtx_lock(&ctx->shpool->mutex);
+
+    // 获取当前时间
+    tp = ngx_timeofday();
+    now = (uint64_t) tp->sec * 1000 + tp->msec;
+
+    /* first run through: get total number of elements we need to allocate */
+
+    // 第一个 O(n) 枚举队列节点，统计 max_count 数量的未过期节点，得到 total 应该输出的节点数量
+    q = ngx_queue_last(&ctx->sh->queue);
+    while (q != ngx_queue_sentinel(&ctx->sh->queue)) {
+        prev = ngx_queue_prev(q);
+
+        sd = ngx_queue_data(q, ngx_http_lua_shdict_node_t, queue);
+
+        if (sd->expires == 0 || sd->expires > now) {
+            total++;
+            if (attempts && total == attempts) {
+                break;
+            }
+        }
+
+        q = prev;
+    }
+
+    // 利用 total 事先创建一个大小恰当的输出 table
+    lua_createtable(L, total, 0);
+
+    // 第二个 O(n) 枚举队列节点，遍历 max_count 数量的未过期节点，并把 key 作为字符串插入 table
+    total = 0;
+    q = ngx_queue_last(&ctx->sh->queue);
+
+    while (q != ngx_queue_sentinel(&ctx->sh->queue)) {
+        prev = ngx_queue_prev(q);
+
+        sd = ngx_queue_data(q, ngx_http_lua_shdict_node_t, queue);
+
+        if (sd->expires == 0 || sd->expires > now) {
+            lua_pushlstring(L, (char *) sd->data, sd->key_len);
+            lua_rawseti(L, -2, ++total);
+            if (attempts && total == attempts) {
+                break;
+            }
+        }
+
+        q = prev;
+    }
+
+    // 解锁共享内存，并退出
+    ngx_shmtx_unlock(&ctx->shpool->mutex);
+    return 1;
+}
+
+```
+
+由此可见， ngx_http_lua_shdict_get_keys 为了确定输出 table 的元素数量上，多做了一次遍历，输出的 table 因此有了确定的元素数量而不会自动扩展内存，这就是作者注释当中描述的时间换空间的技术细节了，由此可见作者在技术偏好上，更倾向于使用更小的内存完成这个操作，对 CPU 消耗会更多，可见这个 API 的使用场景在数据量不大的场景下使用会比较合适。
+
+共享内存字典的 API 其实还有 flush_all ， delete ， flush_expired ， incr 等，这些 API 相对简单，而且基本流程在上述的 API 中都有描述，这里就不一一做解析了。
 
 
 ## 总结
-从 set 和 get 系列的代码分析可以看出：
+从 set 和 get 等系列的代码分析可以看出：
 *  由于使用了共享内存，所以内存分配用了 slab 内存分配机制。
 *  由于要实现字典功能，所以内存的组织结构使用了红黑树作为底层实现。
 *  但除了红黑树，节点其实还需要插入到一个队列中，这是未解之谜 1 。
 *  红黑树使用的 key 是一个整数，在共享内存字典的索引字符串先被 CRC 算法计算一次得到 hash 然后作为红黑树的索引 key 使用，这个使用导致其实 红黑树对原本的索引字符串而言并没有排序功能，不能实现条件范围搜索的功能。
 *  除了使用了红黑树作为基础，为了实现有效期功能，添加了有效期相关的 ngx_http_lua_shdict_expire 、 ngx_http_lua_shdict_rbtree_insert_value 以及 ngx_http_lua_shdict_lookup 等函数。
+*  在 get_keys api 中使用了两次遍历循环，以便时间换空间，在数据量小的场景使用比较合适。
 
 从实现上不难看出，共享内存字典的实现很大程度上参考了 ngx_http_limit_req_module 对红黑树使用的代码实现，事实上这两处功能其实基本相同，作者参考成熟度较高的 ngx_http_limit_req_module 模块代码也为其本身成熟度奠定了良好的基础。
