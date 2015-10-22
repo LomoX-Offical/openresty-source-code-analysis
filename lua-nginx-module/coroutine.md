@@ -535,4 +535,36 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
 *  在所有分支逻辑里边最终会把 ctx->co_op 设置成 NGX_HTTP_LUA_USER_CORO_NOP
 *  在 ctx->co_op = NGX_HTTP_LUA_USER_CORO_NOP，也就是再也没有需要执行的线程的情况下，会跳出函数，跳出这一次 Lua 代码执行，回到请求处理流程中
 
+事实上， ngx_http_lua_run_thread 函数其实就是 access 、 content 、 rewrite 、 timer 等阶段的 Lua 代码启动函数，他里边的逻辑就包含了对线程的 yield 和 resume 的处理。
 
+## coroutine.status
+
+这个函数功能相对简单，就是把线程的状态返回给 Lua 调用者，他的实现由 C 函数 ngx_http_lua_coroutine_status 提供
+
+```c
+static int
+ngx_http_lua_coroutine_status(lua_State *L)
+{
+    co = lua_tothread(L, 1);
+    r = ngx_http_lua_get_req(L);
+    ctx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
+
+    // 上下文检查
+    ngx_http_lua_check_context(L, ctx, NGX_HTTP_LUA_CONTEXT_REWRITE
+                               | NGX_HTTP_LUA_CONTEXT_ACCESS
+                               | NGX_HTTP_LUA_CONTEXT_CONTENT
+                               | NGX_HTTP_LUA_CONTEXT_TIMER);
+
+    // 获得上下文
+    coctx = ngx_http_lua_get_co_ctx(co, ctx);
+
+    //　把状态值转换为字符串处理，作为返回值入栈
+    lua_pushlstring(L, (const char *)
+                    ngx_http_lua_co_status_names[coctx->co_status].data,
+                    ngx_http_lua_co_status_names[coctx->co_status].len);
+    return 1;
+}
+```
+
+## 总结
+其实就是简单的使用 lua_yield 以及 lua_resume 的使用，外加一些线程上下文的状态保存逻辑。
